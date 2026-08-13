@@ -1,0 +1,6 @@
+# Dev/test only. Install with:  pip install -r requirement.txt -r requirements-dev.txt
+-r requirement.txt
+
+httpx==0.28.1
+pytest==9.1.1
+pytest-asyncio==1.4.0
