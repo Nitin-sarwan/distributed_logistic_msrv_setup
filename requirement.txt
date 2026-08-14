@@ -14,3 +14,19 @@ starlette==1.6.0
 typing-inspection==0.4.3
 typing_extensions==4.16.0
 uvicorn[standard]==0.52.1
+
+# Email validation — required by pydantic's EmailStr
+email-validator==2.3.0
+
+# Password hashing
+bcrypt==5.0.0
+
+# AES-256-CBC token cipher, kept compatible with the Node service
+cryptography==50.0.0
+
+# Shared session store. As of 4.x pymongo depends on dnspython directly, so
+# mongodb+srv:// URIs resolve without the (now removed) [srv] extra.
+pymongo==4.17.0
+
+# Gateway -> service HTTP forwarding
+httpx==0.28.1
