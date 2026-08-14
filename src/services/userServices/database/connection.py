@@ -1,31 +1,19 @@
 import logging
 import time
 
-from sqlalchemy import create_engine, text, URL
+from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
-from src.config import settings
-database_url = URL.create(
-    drivername="postgresql+psycopg",
-    username=settings.db_user,
-    password=settings.db_password,
-    host=settings.db_host,
-    port=settings.db_port,
-    database=settings.db_name,
-)
+from src.services.userServices.config import settings
+from src.services.userServices.database.base import Base
 
 logger = logging.getLogger(__name__)
 
 engine = create_engine(
-    database_url,
+    settings.database_url,
     pool_pre_ping=True,   # drop stale connections instead of raising mid-request
 )
-
-
-class Base(DeclarativeBase):
-    pass
-
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -51,6 +39,16 @@ def check_database_connection(retries: int = 5, delay: float = 2) -> None:
                 time.sleep(delay)
 
     raise RuntimeError(f"Could not connect to database after {retries} attempts")
+
+
+def create_tables() -> None:
+    # Import models so they register on Base.metadata before create_all runs.
+    from src.services.userServices.models import (  # noqa: F401
+        session_model,
+        user_model,
+    )
+
+    Base.metadata.create_all(bind=engine)
 
 
 def get_db():
