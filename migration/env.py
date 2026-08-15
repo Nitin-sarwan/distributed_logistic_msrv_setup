@@ -19,7 +19,11 @@ from src.services.userServices.database.base import Base
 
 # Models must be imported so they register on Base.metadata before autogenerate
 # inspects it — an unimported model looks like a table that should be dropped.
-from src.services.userServices.models import user_model  # noqa: F401
+from src.services.userServices.models import (  # noqa: F401
+    address_model,
+    password_reset_model,
+    user_model,
+)
 
 target_metadata = Base.metadata
 

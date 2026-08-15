@@ -171,13 +171,39 @@ So after creating `models/order_model.py`, add it to `migration/env.py`:
 
 ```python
 from src.services.userServices.models import (  # noqa: F401
+    address_model,
     order_model,
+    password_reset_model,
     user_model,
 )
 ```
 
 The `# noqa: F401` is deliberate — linters flag these as unused, but the import
 side effect is the entire point.
+
+### This has already happened once
+
+The `address` table was created by a **hand-written migration with no model**.
+The next `--autogenerate` compared the database against `Base.metadata`, found
+`address` in one and not the other, and emitted:
+
+```python
+op.drop_table('address')
+```
+
+Running `upgrade head` without reading the file dropped the table. It was
+recovered with `alembic downgrade`, but **any rows in it would have been gone** —
+`downgrade` recreates structure, not data.
+
+Two rules come out of that:
+
+1. **Every table needs a model**, even one nothing queries yet.
+   `address_model.py` exists purely so Alembic can see the table.
+2. **Read the generated migration before applying it.** A `drop_table` you did
+   not ask for is the signal that a model is missing from `env.py`.
+
+A quick way to confirm there is no drift: run `--autogenerate` and check the
+generated `upgrade()` is just `pass`, then delete the file.
 
 ---
 

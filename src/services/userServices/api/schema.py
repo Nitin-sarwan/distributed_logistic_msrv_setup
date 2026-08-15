@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class RegisterUser(BaseModel):
@@ -57,8 +57,46 @@ class AuthResponse(BaseModel):
 
     user: UserResponse
     access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_at: datetime
+    refresh_expires_at: datetime
+    device_session: str
+    device_id: str
+
+
+class RefreshResponse(BaseModel):
+    """A refresh returns a new access token only — the refresh token persists."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    user: UserResponse
+    access_token: str
     token_type: str = "bearer"
     expires_at: datetime
     device_session: str
     device_id: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class ChangePassword(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+class ForgotPassword(BaseModel):
+    email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: EmailStr) -> str:
+        return str(value).strip().lower()
+
+
+class ResetPassword(BaseModel):
+    token: str
+    new_password: str = Field(min_length=8)
 

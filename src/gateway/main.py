@@ -2,9 +2,12 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from pymongo.errors import PyMongoError
 
+from src.common.request_auth import extract_token
 from src.config import settings
+from src.database.session_store import get_active_session
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,6 +19,23 @@ logger = logging.getLogger(__name__)
 SERVICE_ROUTES: dict[str, str] = {
     "/api/users": settings.user_service_url,
 }
+
+# Reachable without a token. Everything else is rejected at the edge.
+PUBLIC_PATHS: set[str] = {
+    "/api/users/register",
+    "/api/users/login",
+    # Called precisely when the access token has expired, so requiring one
+    # would defeat the purpose. The refresh token in the body is the credential.
+    "/api/users/refresh",
+    # Reached by someone who cannot sign in, by definition.
+    "/api/users/forgot-password",
+    "/api/users/reset-password",
+    "/health",
+}
+
+# Identity the gateway asserts downstream. Any client-supplied copy is stripped
+# first — otherwise anyone could forge a user id just by sending the header.
+IDENTITY_HEADERS = {"x-user-id", "x-session-id", "x-device-session"}
 
 # Hop-by-hop headers are connection-scoped and must not be forwarded.
 # Content-Length is dropped too, since httpx recomputes it for the new body.
@@ -38,6 +58,35 @@ def resolve_service(path: str) -> str | None:
         if path == prefix or path.startswith(prefix + "/"):
             return SERVICE_ROUTES[prefix]
     return None
+
+
+def is_public(path: str) -> bool:
+    return path.rstrip("/") in PUBLIC_PATHS
+
+
+def authenticate(request: Request) -> dict | None:
+    """Coarse edge check: is there a live session for this token?
+
+    The gateway cannot decrypt the token — token_secret is per-user and lives in
+    the owning service's private database. What it can do is consult the shared
+    session store, which is the source of truth for revocation. The service
+    still performs full cryptographic validation; this only stops unauthenticated
+    traffic from reaching it at all.
+    """
+    token = extract_token(request)
+    if token is None:
+        return None
+
+    try:
+        return get_active_session(token)
+    except PyMongoError as error:
+        # Fail closed: if the session store is unreachable we cannot prove the
+        # caller is authenticated, so we must not forward the request.
+        logger.warning("Session lookup failed: %s", error)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session store unavailable",
+        ) from error
 
 
 @asynccontextmanager
@@ -90,7 +139,25 @@ async def proxy(path: str, request: Request):
             media_type="application/json",
         )
 
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP and k.lower() not in IDENTITY_HEADERS
+    }
+
+    if not is_public(full_path):
+        session = authenticate(request)
+        if session is None:
+            return Response(
+                content='{"detail":"Not authenticated"}',
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                media_type="application/json",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        # Hints for the service. It re-verifies the token regardless — these
+        # save work, they are not evidence.
+        headers["x-user-id"] = str(session["user"])
+        headers["x-device-session"] = session.get("device_session", "")
 
     # The service sees the gateway as its peer, so the real client IP has to be
     # forwarded explicitly — session records depend on it.

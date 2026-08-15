@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -90,6 +91,37 @@ def decrypt_data(encrypted_data: str, key: str) -> dict | None:
         return None
 
 
+def create_refresh_token(user) -> tuple[str, str, datetime]:
+    """A longer-lived token whose only power is minting new access tokens.
+
+    Same cipher and same per-user key, but marked with type="refresh" so it can
+    never be presented as an access token — see get_current_user, which rejects
+    any payload that is not an access token.
+    """
+    jti = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=settings.refresh_token_expire_days)
+
+    payload = {
+        "id": user.id,
+        "type": "refresh",
+        "jti": jti,
+        "timeStamp": int(now.timestamp() * 1000),
+        "exp": int(expires_at.timestamp()),
+    }
+    return encrypt_data(payload, user.token_secret), jti, expires_at
+
+
+def generate_reset_token() -> tuple[str, str]:
+    """Return (token, sha256 hash). Only the hash is ever persisted."""
+    token = secrets.token_urlsafe(48)
+    return token, hash_reset_token(token)
+
+
+def hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def create_access_token(user) -> tuple[str, str, datetime]:
     """Encrypt a session token with the user's own token_secret as the salt.
 
@@ -104,6 +136,9 @@ def create_access_token(user) -> tuple[str, str, datetime]:
         "id": user.id,
         "name": user.name,
         "email": user.email,
+        # Marks this as usable for authentication. A refresh token carries
+        # type="refresh" and is rejected by get_current_user.
+        "type": "access",
         "jti": jti,
         "timeStamp": int(now.timestamp() * 1000),
         "exp": int(expires_at.timestamp()),

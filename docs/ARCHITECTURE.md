@@ -82,6 +82,53 @@ shared infrastructure.
 
 ---
 
+## How authentication is split
+
+Authentication happens **twice**, and that is deliberate — neither layer can do
+the other's job.
+
+```
+   client ──Authorization: Bearer──▶ Gateway ────────▶ userServices
+                                       │                    │
+                        "is there a live session          "decrypt the token
+                         for this token?"                  with this user's
+                                       │                   token_secret"
+                                       ▼                        ▼
+                                Mongo sessions            Postgres users
+                                  (shared)                  (private)
+```
+
+| | Gateway | Service |
+| --- | --- | --- |
+| Question | Is there a live session? | Is this token cryptographically valid for this user? |
+| Reads | Mongo session store | Its own Postgres, then decrypts |
+| Can decrypt? | **No** | Yes |
+| Purpose | Reject anonymous traffic at the edge | The authoritative answer |
+
+**Why the gateway can't finish the job.** Tokens are AES-encrypted with a
+per-user `token_secret` that lives in userServices' private Postgres. The
+gateway has no access to it — that boundary is what makes these separate
+services. It authenticates against the shared session store instead, which is
+enough to reject unauthenticated traffic but not enough to be final.
+
+**Why the service checks again.** A service reachable directly — by a bug, a
+misrouted prefix, or a future internal caller — must not be authenticated by a
+header some proxy set. The gateway's `X-User-Id` saves a lookup; it is not
+evidence. A direct request with a forged `X-User-Id` and no token gets `401`.
+
+**Why not just fetch `token_secret` over HTTP?** It would work, and it is the
+wrong trade. The secret currently exists in one table and one process; putting
+it on the wire on every request multiplies where it can leak, and forces the
+service to expose an endpoint that hands out key material — anything reaching
+that endpoint could mint tokens for every user. If the gateway ever needs the
+full check, the right shape is token *introspection*: ask the service for a
+verdict, not for the key.
+
+Public paths (`register`, `login`, `health`) skip both checks — you cannot hold
+a token before you have one.
+
+---
+
 ## Requirements
 
 | | Notes |
@@ -170,6 +217,26 @@ curl -X POST http://127.0.0.1:8000/api/users/register `
 
 Expect `201` with a user, an access token, and device identifiers.
 
+### An authenticated request
+
+Registering or logging in returns an `access_token`. Send it as a header —
+query parameters are not accepted:
+
+```powershell
+curl.exe http://127.0.0.1:8000/api/users/profile -H "Authorization: Bearer <token>"
+```
+
+`401 Not authenticated` means no token, a bad token, or a revoked session.
+`POST /api/users/logout` with the same header revokes it — the next request
+with that token fails immediately.
+
+Register and login also return a **refresh token**. When the access token
+expires (60 minutes), exchange it rather than signing in again:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/api/users/refresh -H "Content-Type: application/json" -d "{\"refresh_token\":\"<token>\"}"
+```
+
 Interactive docs — note these are **per service**, since the gateway has no
 OpenAPI schema of its own:
 
@@ -222,6 +289,19 @@ Run from the repo root.
 **`ValidationError: field required`**
 A key is missing from `.env`. The message names it.
 
+**`401 Not authenticated` on an endpoint that should be public**
+It is not in the gateway's `PUBLIC_PATHS`. Matching is exact, so a new public
+endpoint has to be listed there.
+
+**`503 Session store unavailable`**
+The gateway could not reach Mongo. It fails closed on purpose — treating an
+outage as "authenticated" would be a bypass.
+
+**A route returns 404 that you know exists**
+The service is running older code. `--reload` keeps serving the previous app if
+the new one fails to import, so a syntax error mid-edit leaves a stale route
+table. Check with `curl.exe http://127.0.0.1:8001/openapi.json`.
+
 ---
 
 ## Conventions
@@ -230,17 +310,37 @@ A key is missing from `.env`. The message names it.
 - **Run everything from the repo root**
 - **Schema changes go through Alembic**, never `create_all()`
 - **A service never touches another service's database**
+- **A service authenticates its own requests** — never trust a proxy header
+- **Tokens travel in headers**, never query strings
 - **Secrets live in `.env`**, which is gitignored and must never be committed
+
+---
+
+## Shared code
+
+`src/` holds the few things that genuinely belong to everyone:
+
+| Module | What | Why shared |
+| --- | --- | --- |
+| `config.py` | Mongo URI, service URLs, gateway timeout | Infrastructure, not business data |
+| `database/mongo.py` | Mongo client, indexes | One pooled client per process |
+| `database/session_store.py` | Session CRUD | Any service must be able to validate or revoke a session |
+| `common/request_auth.py` | Token / user-id extraction | Gateway and services must accept identical forms, or a request passes one layer and fails the other |
+
+Everything else belongs to a single service.
 
 ---
 
 ## Current state
 
-Working: registration end to end, gateway routing, health aggregation, bcrypt
-hashing, Node-compatible encrypted tokens, Mongo sessions, first migration.
+Working: register, login, profile, logout, log-out-everywhere, token refresh,
+change password, forgot/reset password, gateway routing with edge
+authentication, health aggregation, bcrypt hashing, Node-compatible encrypted
+tokens, Mongo sessions with revocation, migrations.
 
-Not built yet: login, logout, token validation, any service other than users,
-tests.
+Not built yet: `PATCH /profile` for name and phone, email delivery for password
+resets, refresh-token rotation, rate limiting, session listing, any service
+other than users, tests.
 
 Known leftovers: `src/main.py` and `src/database/connection.py` are the legacy
 root app — redundant now, and the latter declares a second unused `Base`.

@@ -47,3 +47,18 @@ class UserRepository:
     def delete(self, user: User) -> None:
         self.db.delete(user)
         self.db.commit()
+
+    def save(self, user: User) -> User:
+        """Persist changes to an already-loaded user."""
+        self.db.commit()
+        self.db.refresh(user)
+        return user
+
+
+    def find_by_id(self,id:int)->User|None:
+        return self.db.scalar(
+            select(User)
+            .where(User.id==id,
+             User.is_deleted.is_(False)
+            )
+        )

@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     # user's tokens.
     access_token_expire_minutes: int = 60
 
+    # Refresh tokens live far longer, so they are stored as their own session
+    # and can be revoked independently of the access token they mint.
+    refresh_token_expire_days: int = 30
+
+    password_reset_expire_minutes: int = 30
+
+    # Local dev only: returns the reset token in the API response because there
+    # is no mail delivery yet. MUST stay false anywhere real — it hands account
+    # takeover to anyone who can guess an email address.
+    password_reset_expose_token: bool = False
+
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
