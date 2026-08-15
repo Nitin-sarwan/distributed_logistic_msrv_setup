@@ -40,6 +40,23 @@ class Settings(BaseSettings):
 
     password_reset_expire_minutes: int = 30
 
+    # ── Session cookie ────────────────────────────────────────────────────
+    # Login and register also return the access token as an HttpOnly cookie, so
+    # a browser holds a credential JavaScript cannot read. The same token is
+    # still returned in the body for non-browser clients.
+
+    # Restricts the cookie to HTTPS. MUST be true anywhere real — over plain
+    # HTTP the cookie is readable by anyone on the network, which defeats the
+    # point of making it HttpOnly. False by default only so local development
+    # over http:// works without certificates.
+    session_cookie_secure: bool = False
+
+    # "lax" blocks the cookie on cross-site POSTs, which is what stops another
+    # site from making authenticated calls on a signed-in user's behalf. Only
+    # loosen to "none" if the frontend is on a genuinely different registrable
+    # domain, and add CSRF tokens if you do — "none" removes this protection.
+    session_cookie_samesite: str = "lax"
+
     # Local dev only: returns the reset token in the API response because there
     # is no mail delivery yet. MUST stay false anywhere real — it hands account
     # takeover to anyone who can guess an email address.

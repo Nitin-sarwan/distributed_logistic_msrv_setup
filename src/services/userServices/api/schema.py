@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 class RegisterUser(BaseModel):
     name: str
     email: EmailStr
-    phone: str | None = None
+    phone: str 
     password: str
 
     @field_validator("email")
@@ -16,9 +16,7 @@ class RegisterUser(BaseModel):
 
     @field_validator("phone")
     @classmethod
-    def validate_phone(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
+    def validate_phone(cls, value: str ) -> str:
         if not value.isdigit():
             raise ValueError("Phone must contain only digits")
         if len(value) != 10:
@@ -33,7 +31,7 @@ class UserResponse(BaseModel):
     id: int
     name: str
     email: EmailStr
-    phone: str | None
+    phone: str 
     created_at: datetime
 
 

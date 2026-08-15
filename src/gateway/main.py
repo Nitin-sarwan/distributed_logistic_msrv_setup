@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import PyMongoError
 
 from src.common.request_auth import extract_token
@@ -36,6 +37,14 @@ PUBLIC_PATHS: set[str] = {
 # Identity the gateway asserts downstream. Any client-supplied copy is stripped
 # first — otherwise anyone could forge a user id just by sending the header.
 IDENTITY_HEADERS = {"x-user-id", "x-session-id", "x-device-session"}
+
+# CORS is answered here and only here. The gateway is the sole browser-facing
+# origin; the services behind it are never called from a browser, so they have
+# no reason to carry CORS middleware of their own. If one ever does, its headers
+# are stripped on relay (see CORS_RESPONSE_PREFIX) rather than being forwarded —
+# two Access-Control-Allow-Origin headers on one response is not "more
+# permissive", it is a hard failure in every browser.
+CORS_RESPONSE_PREFIX = "access-control-"
 
 # Hop-by-hop headers are connection-scoped and must not be forwarded.
 # Content-Length is dropped too, since httpx recomputes it for the new body.
@@ -103,6 +112,30 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="API Gateway", lifespan=lifespan)
+
+# Browser access control. This runs before routing, so a preflight OPTIONS is
+# answered here and never reaches proxy() — which matters, because a preflight
+# carries no credentials and would otherwise be rejected as unauthenticated
+# before the real request ever got a chance to be made.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    # Lets the browser send the session credential. Requires an explicit origin
+    # list above — a wildcard with credentials is rejected by every browser.
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",   # Bearer <token>, the primary credential
+        "Content-Type",
+        "X-Token",         # the alternate credential form extract_token accepts
+        "X-Signature",     # optional, recorded on the session document
+        "X-Requested-With",
+    ],
+    # Cache the preflight so the browser stops re-asking before every request.
+    max_age=600,
+)
+
+logger.info("Gateway CORS origins: %s", settings.cors_origins)
 
 
 @app.get("/health")
@@ -189,11 +222,33 @@ async def proxy(path: str, request: Request):
             media_type="application/json",
         )
 
+    # Relay the service's headers, minus hop-by-hop, minus any CORS headers it
+    # set for itself. The gateway's own middleware adds the authoritative ones
+    # on the way out; forwarding a second set would duplicate
+    # Access-Control-Allow-Origin and the browser would reject the response.
+    #
+    # Set-Cookie is excluded here and re-added below: a dict cannot hold two
+    # entries with the same key, so two cookies would collapse into one
+    # comma-joined header that no browser parses correctly.
     response_headers = {
-        k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP
+        k: v
+        for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP
+        and k.lower() != "set-cookie"
+        and not k.lower().startswith(CORS_RESPONSE_PREFIX)
     }
-    return Response(
+
+    response = Response(
         content=upstream.content,
         status_code=upstream.status_code,
         headers=response_headers,
     )
+
+    # Each Set-Cookie must survive as its own header line. Without this the
+    # session cookie a service issues never reaches the browser, and cookie
+    # authentication silently does not work.
+    for key, value in upstream.headers.multi_items():
+        if key.lower() == "set-cookie":
+            response.raw_headers.append((b"set-cookie", value.encode("latin-1")))
+
+    return response
