@@ -7,6 +7,9 @@ from src.common.request_auth import SESSION_COOKIE_NAME, extract_token
 from src.database.session_store import revoke_session
 from src.services.userServices.api.dependencies import get_current_user
 from src.services.userServices.api.schema import (
+    AddressCreate,
+    AddressResponse,
+    AddressUpdate,
     AuthResponse,
     ChangePassword,
     ForgotPassword,
@@ -20,8 +23,12 @@ from src.services.userServices.api.schema import (
 from src.services.userServices.config import settings
 from src.services.userServices.database.connection import get_db
 from src.services.userServices.models.user_model import User
+from src.services.userServices.services.address_services import AddressService
 from src.services.userServices.services.user_services import UserService
-from src.services.userServices.utils.exceptions import RegistrationFailedError
+from src.services.userServices.utils.exceptions import (
+    AddressNotFoundError,
+    RegistrationFailedError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +37,10 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 def get_user_service(db: Session = Depends(get_db)) -> UserService:
     return UserService(db)
+
+
+def get_address_service(db: Session = Depends(get_db)) -> AddressService:
+    return AddressService(db)
 
 
 def set_session_cookie(response: Response, token: str) -> None:
@@ -209,6 +220,86 @@ def forgot_password(
             response["reset_token"] = token
 
     return response
+
+
+# ── Addresses ──────────────────────────────────────────────────────────────
+#
+# All four require a session. They sit under the router's /users prefix, so
+# they are reachable at /api/users/addresses — inside the gateway's /api/users
+# route and absent from its PUBLIC_PATHS, which means the edge rejects
+# anonymous traffic before it ever arrives here.
+#
+# No endpoint takes a user id. Identity comes from get_current_user, and the
+# queries are scoped by it, so one user cannot read or change another's
+# addresses whatever they put in the URL.
+
+
+@router.get(
+    "/addresses",
+    response_model=list[AddressResponse],
+    status_code=status.HTTP_200_OK,
+)
+def list_addresses(
+    user: User = Depends(get_current_user),
+    service: AddressService = Depends(get_address_service),
+):
+    return service.list_addresses(user)
+
+
+@router.post(
+    "/addresses",
+    response_model=AddressResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_address(
+    payload: AddressCreate,
+    user: User = Depends(get_current_user),
+    service: AddressService = Depends(get_address_service),
+):
+    return service.create_address(user, payload)
+
+
+@router.patch(
+    "/addresses/{address_id}",
+    response_model=AddressResponse,
+    status_code=status.HTTP_200_OK,
+)
+def update_address(
+    address_id: int,
+    payload: AddressUpdate,
+    user: User = Depends(get_current_user),
+    service: AddressService = Depends(get_address_service),
+):
+    try:
+        return service.update_address(user, address_id, payload)
+    except AddressNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=error.message,
+        ) from error
+
+
+@router.delete(
+    "/addresses/{address_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_address(
+    address_id: int,
+    user: User = Depends(get_current_user),
+    service: AddressService = Depends(get_address_service),
+):
+    try:
+        service.delete_address(user, address_id)
+    except AddressNotFoundError as error:
+        # 404 rather than 403 even when the address exists but belongs to
+        # someone else: a 403 would confirm the id is real, which is a fact the
+        # caller has no business learning.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=error.message,
+        ) from error
+
+    # 204 carries no body, so nothing is returned.
 
 
 @router.post("/reset-password", status_code=status.HTTP_200_OK)
