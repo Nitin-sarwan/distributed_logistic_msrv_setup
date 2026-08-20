@@ -7,6 +7,15 @@ It is **self-contained**: its own config, its own database engine, its own
 FastAPI app. It shares only the session store (Mongo) with the rest of the
 system.
 
+Its sibling is [PARTNER_SERVICE.md](PARTNER_SERVICE.md), which owns the delivery
+partners. Same four layers, same token scheme, separate database — the two never
+read each other's tables.
+
+This process also answers `/api/geo/*`, which is *not* part of this service's
+domain: it owns no tables, needs no session, and is routed under its own gateway
+prefix so it can be moved to a process of its own without a caller noticing. It
+is documented separately in [GEO.md](GEO.md).
+
 ---
 
 ## Layout
@@ -17,6 +26,7 @@ src/services/userServices/
   config.py                    # service settings, owns the DB name
   api/
     routes.py                  # HTTP endpoints
+    geo_routes.py              # /api/geo — address search, reverse lookup
     schema.py                  # Pydantic request/response models
     dependencies.py            # get_current_user — authentication
   services/
@@ -33,6 +43,7 @@ src/services/userServices/
     connection.py              # engine, SessionLocal, get_db
   utils/
     security.py                # hashing + token cipher
+    geocoder.py                # the geocoding provider client
     exceptions.py              # domain errors
 ```
 
@@ -376,8 +387,18 @@ or tokens will not cross between them.
 ## Sessions
 
 Sessions go to **Mongo**, not this service's Postgres — see
-[ARCHITECTURE.md](ARCHITECTURE.md). Written through
-`src/database/session_store.py`, matching the existing Mongoose document shape:
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+> **`app_type` is load-bearing now.** The collection is shared with
+> partnerServices, and the document's `user` field is a bare integer — user 5
+> and partner 5 are different people with the same key. This service writes
+> `app_type = 1` on every session and passes it to every
+> `revoke_user_sessions()` call. Drop it and "log out everywhere" signs out an
+> unrelated delivery partner. The same collision is why the two services use
+> different session cookie names; this one's is `lp_session`.
+
+Written through `src/database/session_store.py`, matching the existing Mongoose
+document shape:
 `user`, `valid_ip`, `os`, `app_type`, `device_id`, `device_info`,
 `device_session`, `is_active`, `signature`, `token_type`, `token`,
 `parent_token`, `login_id`, `last_activity`, `created_at`, `updated_at`.
@@ -412,6 +433,7 @@ is immediate** — there is no window where a revoked token still works.
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `60` | |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `30` | |
 | `PASSWORD_RESET_EXPIRE_MINUTES` | `30` | |
+| `USER_APP_TYPE` | `1` | session discriminator — do not change once live |
 | `PASSWORD_RESET_EXPOSE_TOKEN` | `false` | **Local dev only** — returns the reset token in the API response. Must stay false in production. |
 
 `DB_NAME` from `.env` is deliberately **not** read — that belongs to other
@@ -429,6 +451,14 @@ uvicorn src.services.userServices.main:app --port 8001 --reload
 Startup checks Postgres (5 retries, 2s apart), pings Mongo, and ensures the
 session indexes. It **fails fast** if Postgres is unreachable rather than
 starting and erroring per-request.
+
+> **`Fatal error in launcher: Unable to create process using '...python.exe'
+> '...uvicorn.exe'`** means the venv was created at a different path from where
+> the project now sits — the `.exe` stubs in `venv\Scripts\` hardcode their
+> interpreter's absolute path. Use `python -m uvicorn
+> src.services.userServices.main:app --port 8001 --reload` to carry on, and
+> recreate the venv to fix it properly. See
+> [ARCHITECTURE.md § Common startup problems](ARCHITECTURE.md).
 
 Docs at <http://127.0.0.1:8001/docs>.
 

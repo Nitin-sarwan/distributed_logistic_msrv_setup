@@ -88,6 +88,7 @@ class UserService:
             request,
             refresh_token,
             user.id,
+            app_type=settings.user_app_type,
             expires_at=refresh_expires,
             token_type="refresh",
         )
@@ -98,6 +99,7 @@ class UserService:
             request,
             token,
             user.id,
+            app_type=settings.user_app_type,
             expires_at=expires_at,
             token_type="auth",
             parent_token=refresh_token,
@@ -182,6 +184,7 @@ class UserService:
             request,
             token,
             user.id,
+            app_type=settings.user_app_type,
             expires_at=expires_at,
             token_type="auth",
             parent_token=refresh_token,
@@ -203,7 +206,7 @@ class UserService:
         token_secret is rotated as well, so even a session record that somehow
         survived could not have its token decrypted.
         """
-        revoked = revoke_user_sessions(user.id)
+        revoked = revoke_user_sessions(user.id, app_type=settings.user_app_type)
         user.token_secret = secrets.token_hex(32)
         self.user_repository.save(user)
         return revoked
@@ -226,7 +229,7 @@ class UserService:
 
         # Rotating token_secret already invalidates every token; revoking the
         # sessions makes that visible in the store rather than only at decrypt.
-        revoke_user_sessions(user.id)
+        revoke_user_sessions(user.id, app_type=settings.user_app_type)
 
     def request_password_reset(self, email: str) -> str | None:
         """Issue a reset token, or quietly do nothing if the email is unknown.
@@ -274,5 +277,5 @@ class UserService:
 
         # A reset means the password may have been compromised — evict every
         # existing session rather than leaving an attacker signed in.
-        revoke_user_sessions(user.id)
+        revoke_user_sessions(user.id, app_type=settings.user_app_type)
 

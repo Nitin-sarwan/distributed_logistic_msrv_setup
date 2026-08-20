@@ -62,11 +62,52 @@ from src.database.session_store import get_active_session
 ### `SERVICE_ROUTES`
 
 ```python
-SERVICE_ROUTES = {"/api/users": settings.user_service_url}
+SERVICE_ROUTES = {
+    "/api/users": settings.user_service_url,
+    "/api/partners": settings.partner_service_url,
+    "/api/geo": settings.geo_service_url,
+}
 ```
+
+`/api/geo` is answered by userServices today, which is why it points at the same
+URL — but it is registered as its own prefix rather than nested under
+`/api/users`, so moving geocoding to a dedicated process is this one setting and
+no change to any caller. See [GEO.md](GEO.md).
 
 The routing table: path prefix → service base URL. Adding a service is one entry
 here plus one setting in `.env`.
+
+**What is *not* in this table matters too.** partnerServices also serves
+`/internal/partners/*` for Dispatch and operations. Those paths have no entry
+here, so the gateway answers `404` and the public internet cannot reach them at
+all. An unrouted prefix is a real access control, not an oversight — see
+[PARTNER_SERVICE.md](PARTNER_SERVICE.md).
+
+### `ROUTE_COOKIES`
+
+```python
+ROUTE_COOKIES = {
+    "/api/users": SESSION_COOKIE_NAME,          # lp_session
+    "/api/partners": PARTNER_SESSION_COOKIE_NAME,  # lp_partner_session
+    "/api/geo": SESSION_COOKIE_NAME,
+}
+```
+
+Which HttpOnly cookie carries the credential for each service. The names differ
+so a browser can hold a customer session and a partner session at once — a
+shared name means signing into one silently overwrites the other's cookie, and
+each service is then handed a token it cannot decrypt.
+
+The `/api/geo` entry is never read on the two paths that exist, since both are
+public. It is present because the lookup is unconditional for any non-public path
+under a registered prefix: a typo like `/api/geo/serch` must answer `401` or
+`404`, not raise a `KeyError` inside the gateway.
+
+`extract_token()` takes the cookie name as an argument rather than trying both.
+A browser holding both sends both on every request, and guessing would
+authenticate whichever happened to be checked first. The gateway has already
+resolved the route by the time it authenticates, so it always knows which to
+read.
 
 ### `PUBLIC_PATHS`
 
@@ -77,6 +118,11 @@ PUBLIC_PATHS = {
     "/api/users/refresh",
     "/api/users/forgot-password",
     "/api/users/reset-password",
+    "/api/partners/register",
+    "/api/partners/login",
+    "/api/partners/refresh",
+    "/api/geo/search",
+    "/api/geo/reverse",
     "/health",
 }
 ```
@@ -86,8 +132,12 @@ Reachable without a token, each for a specific reason:
 | Path | Why public |
 | --- | --- |
 | `register`, `login` | You cannot hold a token before you have one. |
+| `geo/search`, `geo/reverse` | The home page lets a visitor describe a delivery before signing in. Bounded by a per-IP quota and a shared cache rather than by a session — see [GEO.md](GEO.md). |
 | `refresh` | Called precisely *because* the access token expired. The refresh token in the body is the credential. |
 | `forgot-password`, `reset-password` | Reached by someone who cannot sign in, by definition. |
+
+partnerServices has no forgot/reset pair yet — see
+[PARTNER_SERVICE.md](PARTNER_SERVICE.md) § Not implemented.
 
 **Everything not listed requires authentication** — the safe default, since
 forgetting to list a new endpoint makes it protected rather than open.
@@ -117,13 +167,14 @@ httpx recomputes it — passing a stale one truncates or hangs the request.
 
 ## Functions
 
-### `resolve_service(path) -> str | None`
+### `match_prefix(path) -> str | None`
 
-Finds the service for a path.
+Finds the registered prefix a path belongs to.
 
 ```python
 for prefix in sorted(SERVICE_ROUTES, key=len, reverse=True):
     if path == prefix or path.startswith(prefix + "/"):
+        return prefix
 ```
 
 **Longest prefix first**, so `/api/users/admin` can be routed separately from
@@ -133,6 +184,10 @@ The `path == prefix or startswith(prefix + "/")` test is deliberate: a plain
 `startswith(prefix)` would match `/api/users-admin`, sending a different
 service's traffic to userServices.
 
+It returns the **prefix**, not the URL, because the caller needs two things
+keyed by it — the destination (`SERVICE_ROUTES`) and the cookie name
+(`ROUTE_COOKIES`). One lookup key keeps the two tables from drifting apart.
+
 Returns `None` when nothing matches → the caller answers 404.
 
 ### `is_public(path) -> bool`
@@ -140,18 +195,24 @@ Returns `None` when nothing matches → the caller answers 404.
 Whether the path skips authentication. `rstrip("/")` means `/api/users/login`
 and `/api/users/login/` behave the same.
 
-### `authenticate(request) -> dict | None`
+### `authenticate(request, cookie_name) -> dict | None`
 
 The edge check. Returns the session document, or `None` for unauthenticated.
 
-**What it can and cannot do.** Access tokens are AES-encrypted with a per-user
-`token_secret` stored in userServices' private Postgres. The gateway has no
-access to that — deliberately, since that boundary is what makes these separate
-services. So it **cannot decrypt the token**.
+**What it can and cannot do.** Access tokens are AES-encrypted with a
+per-subject `token_secret` stored in the owning service's private Postgres. The
+gateway has no access to that — deliberately, since that boundary is what makes
+these separate services. So it **cannot decrypt the token**.
 
 What it *can* do is look the token up in the shared Mongo session store, which
 is where revocation is recorded. That answers "is there a live session for this
 token?" — enough to reject anonymous traffic, not enough to be the last word.
+
+Note what it deliberately does **not** check: whether the session belongs to the
+right *kind* of subject. A customer's token presented to `/api/partners` passes
+here and is rejected by partnerServices, because decrypting it needs a secret in
+a database the gateway cannot read. The edge's job is to turn away anonymous
+traffic, not to be the final word.
 
 On a Mongo error it **fails closed**:
 
@@ -179,7 +240,8 @@ Calls every registered service's `/health` (5s timeout) and aggregates:
 
 ```json
 {"status":"ok","service":"gateway",
- "services":{"/api/users":{"status":"ok","service":"userServices"}}}
+ "services":{"/api/users":{"status":"ok","service":"userServices"},
+             "/api/partners":{"status":"ok","service":"partnerServices"}}}
 ```
 
 `status` is `ok` only if every service reports `ok`, otherwise `degraded` with
@@ -197,8 +259,9 @@ Step by step:
 **1. Resolve, or 404.**
 
 ```python
-base_url = resolve_service(full_path)
-if base_url is None:  # -> 404 "No service registered for ..."
+prefix = match_prefix(full_path)
+if prefix is None:  # -> 404 "No service registered for ..."
+base_url = SERVICE_ROUTES[prefix]
 ```
 
 **2. Filter headers.** Both `HOP_BY_HOP` and `IDENTITY_HEADERS` are dropped —
@@ -209,7 +272,7 @@ survive.
 
 ```python
 if not is_public(full_path):
-    session = authenticate(request)
+    session = authenticate(request, cookie_name=ROUTE_COOKIES[prefix])
     if session is None:   # -> 401 with WWW-Authenticate: Bearer
 ```
 
@@ -262,7 +325,9 @@ Errors *from* a service (409, 422, …) are relayed untouched.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `USER_SERVICE_URL` | `http://127.0.0.1:8001` | Where userServices listens |
+| `PARTNER_SERVICE_URL` | `http://127.0.0.1:8002` | Where partnerServices listens |
 | `GATEWAY_TIMEOUT_SECONDS` | `30.0` | Per-request upstream timeout |
+| `CORS_ALLOW_ORIGINS` | `localhost:5173,127.0.0.1:5173` | Comma separated; never `*` |
 
 ---
 
@@ -275,14 +340,28 @@ uvicorn src.gateway.main:app --port 8000 --reload
 Starts fine with no services running — requests then return `502`. It must not
 depend on start-up order.
 
+> **`Fatal error in launcher: Unable to create process using '...python.exe'
+> '...uvicorn.exe'`** means the venv was created at a different path from where
+> the project now sits — the `.exe` stubs in `venv\Scripts\` hardcode their
+> interpreter's absolute path. Use `python -m uvicorn src.gateway.main:app
+> --port 8000 --reload` to carry on, and recreate the venv to fix it properly.
+> See [ARCHITECTURE.md § Common startup problems](ARCHITECTURE.md).
+
 ---
 
 ## Adding a service
 
-1. `src/config.py` — `order_service_url: str = "http://127.0.0.1:8002"`
+1. `src/config.py` — `order_service_url: str = "http://127.0.0.1:8003"`
 2. `src/gateway/main.py` — `"/api/orders": settings.order_service_url`
-3. `.env` — `ORDER_SERVICE_URL=...`
-4. Add any endpoints that must be reachable without a token to `PUBLIC_PATHS`.
+3. `src/gateway/main.py` — an entry in `ROUTE_COOKIES`. Reuse an existing cookie
+   name only if the new service authenticates the *same* subject; a new kind of
+   subject needs its own name, or its login overwrites the other's cookie.
+4. `.env` — `ORDER_SERVICE_URL=...`
+5. Add any endpoints that must be reachable without a token to `PUBLIC_PATHS`.
+
+If the service has endpoints only other services should call, leave them off
+`/api` entirely rather than trying to protect them here — see
+`/internal/partners/*`.
 
 ---
 

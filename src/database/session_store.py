@@ -172,16 +172,32 @@ def revoke_session(token: str) -> bool:
     return result.modified_count > 0
 
 
-def revoke_user_sessions(user_id: int, except_token: str | None = None) -> int:
-    """Revoke every session for a user — logout-everywhere, or after a breach.
+def revoke_user_sessions(
+    user_id: int,
+    except_token: str | None = None,
+    app_type: int | None = None,
+) -> int:
+    """Revoke every session for a subject — logout-everywhere, or after a breach.
 
     except_token keeps the caller's own session alive, which is what a password
     change wants: evict every other device without signing yourself out.
+
+    **app_type is not optional in practice, only in signature.** `user` in these
+    documents is a bare integer id, and each service numbers its own subjects
+    from 1 — user 5 in `user_db` and partner 5 in `partner_db` are different
+    people who share a key. Without the discriminator, a customer tapping "log
+    out everywhere" knocks an unrelated partner offline mid-delivery.
+
+    It defaults to None so sessions written by the Node service, which predates
+    the field, can still be revoked wholesale. Every caller in this repository
+    passes it.
     """
     timestamp = datetime.now(timezone.utc)
     criteria: dict = {"user": user_id, "is_active": True}
     if except_token is not None:
         criteria["token"] = {"$ne": except_token}
+    if app_type is not None:
+        criteria["app_type"] = app_type
 
     result = sessions_collection().update_many(
         criteria,

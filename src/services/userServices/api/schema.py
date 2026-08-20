@@ -235,3 +235,49 @@ class AddressResponse(BaseModel):
     latitude: float
     longitude: float
 
+
+# ── Geocoding ──────────────────────────────────────────────────────────────
+#
+# The contract for /api/geo. Nothing here touches a table: these are places the
+# provider knows about, not rows this service owns. The field names deliberately
+# match AddressCreate's, so the frontend can fill the address form from a search
+# result without a translation step in between.
+
+
+class PlaceResponse(BaseModel):
+    """One resolved location, in the shape the address form needs.
+
+    `city` can come back empty and `pin_code` null: a pin dropped on an unnamed
+    road genuinely has neither, and inventing values to keep the shape tidy
+    would put wrong data in a column a driver relies on. The user fills the gap;
+    the coordinates — the part that has to be right — are already correct.
+    """
+
+    latitude: float
+    longitude: float
+
+    # The human sentence for a suggestion list. Kept separate from
+    # address_line1, which is the shorter thing that belongs in the form field.
+    label: str
+
+    address_line1: str
+    address_line2: str | None
+    city: str
+    pin_code: str | None
+
+    # Stable per result, so the frontend has a list key that does not shift when
+    # the same query is re-run.
+    place_id: str
+
+
+class ReverseGeocodeResponse(BaseModel):
+    """What is at a point.
+
+    The coordinates are echoed back because they are the authoritative half of
+    the answer — `place` is a convenience that may be null for a field, a new
+    road, or the middle of a lake, and the caller still has a usable pin.
+    """
+
+    latitude: float
+    longitude: float
+    place: PlaceResponse | None

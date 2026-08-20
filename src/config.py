@@ -22,6 +22,13 @@ class Settings(BaseSettings):
 
     # Downstream services the gateway forwards to.
     user_service_url: str = "http://127.0.0.1:8001"
+    partner_service_url: str = "http://127.0.0.1:8002"
+
+    # /api/geo is served by userServices today, so this defaults to the same
+    # host. It is a separate setting rather than a reuse of user_service_url so
+    # that standing geocoding up as its own process is an env change, not a code
+    # change.
+    geo_service_url: str = "http://127.0.0.1:8001"
     gateway_timeout_seconds: float = 30.0
 
     # Browser origins allowed to call the gateway, comma separated.

@@ -13,8 +13,15 @@ token there should be treated as exposed.
 # disagreed, a request would authenticate at one layer and fail at the other.
 SESSION_COOKIE_NAME = "lp_session"
 
+# Partners get their own cookie name. Cookies are keyed by name and domain, so
+# if the partner dashboard and the customer app are ever served from the same
+# host, a shared name would mean signing into one silently overwrites the
+# other's credential — and each service would then be handed a token it cannot
+# decrypt. Two names let both sessions coexist in one browser.
+PARTNER_SESSION_COOKIE_NAME = "lp_partner_session"
 
-def extract_token(request) -> str | None:
+
+def extract_token(request, cookie_name: str = SESSION_COOKIE_NAME) -> str | None:
     """Find the access token.
 
     1. Authorization: Bearer <token>   — preferred; used by non-browser clients
@@ -29,6 +36,13 @@ def extract_token(request) -> str | None:
     The cookie is last rather than absent because it is the only form that can
     be HttpOnly. A token in a header has to be reachable by JavaScript to be
     sent, so any XSS can read it; a cookie the script cannot see survives that.
+
+    `cookie_name` says which audience's cookie to read. It is an explicit
+    argument rather than a "try both" fallback: a browser holding a customer
+    session and a partner session sends both cookies on the same request, and
+    guessing between them would authenticate whichever happened to be checked
+    first. The caller always knows which one it wants — the gateway from the
+    route prefix, a service from the fact that it only has one kind of subject.
     """
     header = request.headers.get("authorization", "")
     scheme, _, value = header.partition(" ")
@@ -39,7 +53,7 @@ def extract_token(request) -> str | None:
     if token:
         return token
 
-    cookie = (request.cookies.get(SESSION_COOKIE_NAME) or "").strip()
+    cookie = (request.cookies.get(cookie_name) or "").strip()
     return cookie or None
 
 

@@ -6,7 +6,11 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import PyMongoError
 
-from src.common.request_auth import extract_token
+from src.common.request_auth import (
+    PARTNER_SESSION_COOKIE_NAME,
+    SESSION_COOKIE_NAME,
+    extract_token,
+)
 from src.config import settings
 from src.database.session_store import get_active_session
 
@@ -17,11 +21,40 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Longest prefix wins, so a more specific route can shadow a broader one.
+#
+# Only /api/* prefixes appear here, which is what makes partnerServices'
+# /internal/* routes unreachable from outside: an unrouted path is a 404 at the
+# edge and never reaches any service.
 SERVICE_ROUTES: dict[str, str] = {
     "/api/users": settings.user_service_url,
+    "/api/partners": settings.partner_service_url,
+    # Geocoding. Answered by userServices today, which is why it points at the
+    # same URL — but it is registered as its own prefix rather than nested under
+    # /api/users, so moving it to a dedicated service later is this one line.
+    "/api/geo": settings.geo_service_url,
+}
+
+# Which HttpOnly cookie carries the credential for each service.
+#
+# The two names are distinct so a browser can hold a customer session and a
+# partner session at once — see PARTNER_SESSION_COOKIE_NAME. The gateway has
+# already resolved the route by the time it authenticates, so it always knows
+# which of the two to read; guessing between them would authenticate whichever
+# cookie happened to be checked first.
+ROUTE_COOKIES: dict[str, str] = {
+    "/api/users": SESSION_COOKIE_NAME,
+    "/api/partners": PARTNER_SESSION_COOKIE_NAME,
+    # Both geo endpoints are public, so this is never read on the paths that
+    # exist. It is here because the lookup below is unconditional for any
+    # non-public path under a registered prefix: a typo like /api/geo/serch must
+    # answer 401 or 404, not blow up on a KeyError.
+    "/api/geo": SESSION_COOKIE_NAME,
 }
 
 # Reachable without a token. Everything else is rejected at the edge.
+#
+# Matching is exact, so a new public endpoint has to be listed here or it will
+# 401 before the service ever sees it.
 PUBLIC_PATHS: set[str] = {
     "/api/users/register",
     "/api/users/login",
@@ -31,6 +64,18 @@ PUBLIC_PATHS: set[str] = {
     # Reached by someone who cannot sign in, by definition.
     "/api/users/forgot-password",
     "/api/users/reset-password",
+    "/api/partners/register",
+    "/api/partners/login",
+    "/api/partners/refresh",
+    # Address lookup, used before anyone has signed in: the home page lets a
+    # visitor describe a delivery first and asks who they are second, and a
+    # search box that demanded an account would undo that.
+    #
+    # Public here means the gateway relays an anonymous request to a third-party
+    # geocoder, so it is bounded on the other side — a per-IP quota, a
+    # process-wide 1 req/s throttle, and a 24h cache. See geo_routes.py.
+    "/api/geo/search",
+    "/api/geo/reverse",
     "/health",
 }
 
@@ -62,10 +107,16 @@ HOP_BY_HOP = {
 }
 
 
-def resolve_service(path: str) -> str | None:
+def match_prefix(path: str) -> str | None:
+    """The registered prefix this path belongs to, or None.
+
+    Returns the prefix rather than the URL because the caller needs both the
+    destination and the cookie name, and looking them up from one key keeps the
+    two tables from drifting apart.
+    """
     for prefix in sorted(SERVICE_ROUTES, key=len, reverse=True):
         if path == prefix or path.startswith(prefix + "/"):
-            return SERVICE_ROUTES[prefix]
+            return prefix
     return None
 
 
@@ -73,16 +124,22 @@ def is_public(path: str) -> bool:
     return path.rstrip("/") in PUBLIC_PATHS
 
 
-def authenticate(request: Request) -> dict | None:
+def authenticate(request: Request, cookie_name: str) -> dict | None:
     """Coarse edge check: is there a live session for this token?
 
-    The gateway cannot decrypt the token — token_secret is per-user and lives in
-    the owning service's private database. What it can do is consult the shared
-    session store, which is the source of truth for revocation. The service
-    still performs full cryptographic validation; this only stops unauthenticated
-    traffic from reaching it at all.
+    The gateway cannot decrypt the token — token_secret is per-subject and lives
+    in the owning service's private database. What it can do is consult the
+    shared session store, which is the source of truth for revocation. The
+    service still performs full cryptographic validation; this only stops
+    unauthenticated traffic from reaching it at all.
+
+    Note what this deliberately does not check: whether the session belongs to
+    the right kind of subject. A customer's token presented to /api/partners
+    passes here and is rejected by partnerServices, because decrypting it needs
+    a secret in a database the gateway cannot read. The edge's job is to turn
+    away anonymous traffic, not to be the final word.
     """
-    token = extract_token(request)
+    token = extract_token(request, cookie_name=cookie_name)
     if token is None:
         return None
 
@@ -163,14 +220,16 @@ async def health():
 )
 async def proxy(path: str, request: Request):
     full_path = "/" + path
-    base_url = resolve_service(full_path)
+    prefix = match_prefix(full_path)
 
-    if base_url is None:
+    if prefix is None:
         return Response(
             content=f'{{"detail":"No service registered for {full_path}"}}',
             status_code=status.HTTP_404_NOT_FOUND,
             media_type="application/json",
         )
+
+    base_url = SERVICE_ROUTES[prefix]
 
     headers = {
         k: v
@@ -179,7 +238,7 @@ async def proxy(path: str, request: Request):
     }
 
     if not is_public(full_path):
-        session = authenticate(request)
+        session = authenticate(request, cookie_name=ROUTE_COOKIES[prefix])
         if session is None:
             return Response(
                 content='{"detail":"Not authenticated"}',
