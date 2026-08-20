@@ -1,8 +1,36 @@
 # Database Migrations (Alembic)
 
-Alembic owns the Postgres schema for `userServices`. Every schema change goes
-through a migration file — never through `create_all()` or hand-written SQL
-against the database.
+Alembic owns the Postgres schema. Every schema change goes through a migration
+file — never through `create_all()` or hand-written SQL against the database.
+
+---
+
+## 0. Two databases, two histories
+
+Each service owns its own database, so each has its own Alembic environment:
+
+| Database | Config file | Scripts | Service |
+| --- | --- | --- | --- |
+| `user_db` | `alembic.ini` (default) | `migration/` | userServices |
+| `partner_db` | `alembic_partner.ini` | `migration_partner/` | partnerServices |
+
+**Every command below takes `-c alembic_partner.ini` when you mean partner_db.**
+
+```powershell
+alembic upgrade head                          # user_db
+alembic -c alembic_partner.ini upgrade head   # partner_db
+```
+
+They cannot be merged. One `alembic_version` table cannot describe two
+databases, and `target_metadata` is built from exactly one `Base` — if both
+services shared one, every `--autogenerate` would find the other service's
+tables missing from the database it is pointed at and emit `op.drop_table()` for
+all of them. §6 records what that looks like in practice.
+
+> **Forgetting `-c` is the failure mode to watch for.** Plain `alembic upgrade
+> head` against a `partner_db` connection reports nothing to do and then stamps
+> its `alembic_version` table with *user* revision ids. Nothing errors; the two
+> histories are just quietly wrong from then on.
 
 ---
 
@@ -24,6 +52,13 @@ Activate the venv:
 .\venv\Scripts\Activate.ps1
 ```
 
+> **If `alembic` dies with `Fatal error in launcher: Unable to create process
+> using '...python.exe' '...alembic.exe'`**, the venv was created at one path
+> and the project has since been moved — every `.exe` in `venv\Scripts\`
+> hardcodes its interpreter's absolute path. Use `python -m alembic ...` to
+> carry on, and recreate the venv to fix it properly. Full explanation in
+> [ARCHITECTURE.md § Common startup problems](ARCHITECTURE.md).
+
 **Run every command from the repo root** (the directory holding `alembic.ini`).
 Alembic resolves `script_location` relative to that file, and `env.py` imports
 `src.…`, which only works from the root.
@@ -39,9 +74,19 @@ migration/
   script.py.mako             # template for new migration files
   versions/                  # the migration files themselves
     9d7c2a5904e4_create_users_table.py
+
+alembic_partner.ini          # script_location = migration_partner
+migration_partner/
+  env.py                     # same wiring, pointed at partnerServices
+  script.py.mako
+  versions/
+    b1f4a72c9e01_create_partners_and_vehicles.py
 ```
 
-Two project-specific details in `migration/env.py`:
+The two `env.py` files are identical but for which `Base` and `settings` they
+import.
+
+Two project-specific details in each `env.py`:
 
 ```python
 target_metadata = Base.metadata
@@ -54,8 +99,8 @@ interpolation — the percent-encoded DB password would crash or silently mangle
 This also keeps the password out of a tracked file. Leave the placeholder
 `sqlalchemy.url` in `alembic.ini` alone; it is overridden at runtime.
 
-The database it targets is `user_db` — the name is pinned in
-`src/services/userServices/config.py`, not in `.env`.
+The database each targets is pinned in that service's own `config.py`
+(`user_db`, `partner_db`), not in `.env`.
 
 ---
 
@@ -167,17 +212,75 @@ index and unique-constraint changes, and most type changes.
 but is never imported is invisible to Alembic — worse, if its table already
 exists in the database, autogenerate reads that as a table it should **drop**.
 
-So after creating `models/order_model.py`, add it to `migration/env.py`:
+So after creating `models/order_model.py`, add it to that service's `env.py`:
 
 ```python
+# migration/env.py
 from src.services.userServices.models import (  # noqa: F401
+    address_model,
     order_model,
+    password_reset_model,
     user_model,
+)
+
+# migration_partner/env.py
+from src.services.partnerServices.models import (  # noqa: F401
+    partner_model,
+    vehicle_model,
 )
 ```
 
 The `# noqa: F401` is deliberate — linters flag these as unused, but the import
 side effect is the entire point.
+
+### A quieter version of the same trap
+
+`--autogenerate` also proposes "fixes" when a migration builds a constraint in a
+shape the model does not. `partners.phone` is declared `unique=True,
+index=True`, which SQLAlchemy renders as **one unique index** — not a
+`UNIQUE` constraint plus an index. The first draft of
+`b1f4a72c9e01_create_partners_and_vehicles.py` wrote both, and every subsequent
+autogenerate wanted to drop the constraint and rebuild the index.
+
+Nothing was broken, and nothing said so. The way to find it is the drift check
+below, which is worth running once after any hand-written migration.
+
+### This has already happened once
+
+The `address` table was created by a **hand-written migration with no model**.
+The next `--autogenerate` compared the database against `Base.metadata`, found
+`address` in one and not the other, and emitted:
+
+```python
+op.drop_table('address')
+```
+
+Running `upgrade head` without reading the file dropped the table. It was
+recovered with `alembic downgrade`, but **any rows in it would have been gone** —
+`downgrade` recreates structure, not data.
+
+Two rules come out of that:
+
+1. **Every table needs a model**, even one nothing queries yet.
+   `address_model.py` exists purely so Alembic can see the table.
+2. **Read the generated migration before applying it.** A `drop_table` you did
+   not ask for is the signal that a model is missing from `env.py`.
+
+### The drift check
+
+Run `--autogenerate` and confirm the generated `upgrade()` body is just `pass`,
+then delete the file:
+
+```powershell
+alembic -c alembic_partner.ini revision --autogenerate -m "drift check"
+# read migration_partner/versions/<rev>_drift_check.py -> should be `pass`
+# then delete it
+```
+
+Anything else means the models and the database disagree. A `drop_table` you did
+not ask for means a model is missing from `env.py`; a constraint being dropped
+and re-added means a hand-written migration built it in a different shape from
+the model.
 
 ---
 
@@ -218,6 +321,19 @@ alembic merge -m "merge heads" <rev1> <rev2>
 
 **`ModuleNotFoundError: No module named 'src'`**
 You are not in the repo root. `cd` there and retry.
+
+**`Fatal error in launcher: Unable to create process using …`**
+The venv was created at a different path from where the project now sits, so
+`alembic.exe` points at an interpreter that is not there. `python -m alembic …`
+works around it immediately; recreating the venv fixes it. See
+[ARCHITECTURE.md § Common startup problems](ARCHITECTURE.md).
+
+Every command in this file has a `python -m alembic` equivalent:
+
+```powershell
+python -m alembic upgrade head
+python -m alembic -c alembic_partner.ini upgrade head
+```
 
 **`InterpolationSyntaxError` from configparser**
 Something put a raw `%` into `alembic.ini`. The URL belongs in `env.py` (§2).

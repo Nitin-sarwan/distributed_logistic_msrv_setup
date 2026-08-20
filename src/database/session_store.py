@@ -76,6 +76,10 @@ def insert_session(data: dict) -> dict:
         "token": data["token"],
         "parent_token": data.get("parent_token"),
         "login_id": data.get("login_id") or "",
+        # Additive to the Node/Mongoose shape. The token carries its own exp,
+        # but only the owning service can decrypt it — storing expiry here lets
+        # the gateway reject stale sessions without the per-user key.
+        "expires_at": data.get("expires_at"),
         "last_activity": timestamp,
         "created_at": timestamp,
         "updated_at": timestamp,
@@ -86,17 +90,33 @@ def insert_session(data: dict) -> dict:
     return insert_data
 
 
-def create_session(request, token: str, user_id: int, app_type: int = 1) -> dict:
+def create_session(
+    request,
+    token: str,
+    user_id: int,
+    app_type: int = 1,
+    expires_at: datetime | None = None,
+    token_type: str = "auth",
+    parent_token: str | None = None,
+    device_session: str | None = None,
+    device_id: str | None = None,
+) -> dict:
+    """Record a session.
+
+    device_session/device_id can be carried over from an existing session so a
+    refresh keeps the same device identity instead of inventing a new one.
+    """
     request_info = get_request_info(request)
-    device_session = "ds_" + generate_random_signature(8)
-    device_id = "di_" + generate_random_signature(7)
+    device_session = device_session or "ds_" + generate_random_signature(8)
+    device_id = device_id or "di_" + generate_random_signature(7)
 
     session_data = {
         "user": user_id,
+        "expires_at": expires_at,
         "signature": request.headers.get("x-signature", ""),
-        "parent_token": None,
+        "parent_token": parent_token,
         "token": token,
-        "token_type": "auth",
+        "token_type": token_type,
         "user_ip": request_info["ip"],
         "browser": request_info["browser"],
         "os": request_info["os"],
@@ -111,10 +131,26 @@ def create_session(request, token: str, user_id: int, app_type: int = 1) -> dict
 
 
 def get_active_session(token: str) -> dict | None:
-    return sessions_collection().find_one(
+    """Return the session only if it is active and not past expiry.
+
+    expires_at is treated as optional so sessions written by the Node service,
+    which does not set it, still validate on is_active alone.
+    """
+    session = sessions_collection().find_one(
         {"token": token, "is_active": True},
         {"_id": 0},
     )
+    if session is None:
+        return None
+
+    expires_at = session.get("expires_at")
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            return None
+
+    return session
 
 
 def touch_session(token: str) -> bool:
@@ -136,11 +172,62 @@ def revoke_session(token: str) -> bool:
     return result.modified_count > 0
 
 
-def revoke_user_sessions(user_id: int) -> int:
-    """Revoke every session for a user — logout-everywhere, or after a breach."""
+def revoke_user_sessions(
+    user_id: int,
+    except_token: str | None = None,
+    app_type: int | None = None,
+) -> int:
+    """Revoke every session for a subject — logout-everywhere, or after a breach.
+
+    except_token keeps the caller's own session alive, which is what a password
+    change wants: evict every other device without signing yourself out.
+
+    **app_type is not optional in practice, only in signature.** `user` in these
+    documents is a bare integer id, and each service numbers its own subjects
+    from 1 — user 5 in `user_db` and partner 5 in `partner_db` are different
+    people who share a key. Without the discriminator, a customer tapping "log
+    out everywhere" knocks an unrelated partner offline mid-delivery.
+
+    It defaults to None so sessions written by the Node service, which predates
+    the field, can still be revoked wholesale. Every caller in this repository
+    passes it.
+    """
+    timestamp = datetime.now(timezone.utc)
+    criteria: dict = {"user": user_id, "is_active": True}
+    if except_token is not None:
+        criteria["token"] = {"$ne": except_token}
+    if app_type is not None:
+        criteria["app_type"] = app_type
+
+    result = sessions_collection().update_many(
+        criteria,
+        {"$set": {"is_active": False, "updated_at": timestamp}},
+    )
+    return result.modified_count
+
+
+def revoke_children(parent_token: str) -> int:
+    """Revoke every access token a given refresh token minted.
+
+    The refresh token itself survives — this is what a refresh call uses to
+    retire the access token it is replacing.
+    """
     timestamp = datetime.now(timezone.utc)
     result = sessions_collection().update_many(
-        {"user": user_id, "is_active": True},
+        {"parent_token": parent_token, "is_active": True},
+        {"$set": {"is_active": False, "updated_at": timestamp}},
+    )
+    return result.modified_count
+
+
+def revoke_session_family(parent_token: str) -> int:
+    """Revoke a refresh token and every access token it minted."""
+    timestamp = datetime.now(timezone.utc)
+    result = sessions_collection().update_many(
+        {
+            "$or": [{"token": parent_token}, {"parent_token": parent_token}],
+            "is_active": True,
+        },
         {"$set": {"is_active": False, "updated_at": timestamp}},
     )
     return result.modified_count
