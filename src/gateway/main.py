@@ -32,6 +32,10 @@ SERVICE_ROUTES: dict[str, str] = {
     # same URL — but it is registered as its own prefix rather than nested under
     # /api/users, so moving it to a dedicated service later is this one line.
     "/api/geo": settings.geo_service_url,
+    "/api/orders": settings.order_service_url,
+    # Same service, partner-facing. A separate prefix because the cookie that
+    # authenticates it is a different one.
+    "/api/deliveries": settings.order_service_url,
 }
 
 # Which HttpOnly cookie carries the credential for each service.
@@ -49,6 +53,11 @@ ROUTE_COOKIES: dict[str, str] = {
     # non-public path under a registered prefix: a typo like /api/geo/serch must
     # answer 401 or 404, not blow up on a KeyError.
     "/api/geo": SESSION_COOKIE_NAME,
+    # Orders belong to customers, so the customer cookie carries them. Order
+    # re-checks the session's app_type itself — see its api/dependencies.py for
+    # why a service that cannot decrypt a token must not settle for a header.
+    "/api/orders": SESSION_COOKIE_NAME,
+    "/api/deliveries": PARTNER_SESSION_COOKIE_NAME,
 }
 
 # Reachable without a token. Everything else is rejected at the edge.

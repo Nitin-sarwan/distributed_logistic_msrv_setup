@@ -323,7 +323,7 @@ Fatal error in launcher: Unable to create process using
    "C:\Users\...\Desktop\distributed_logistic\distributed_logistic_msrv\venv\scripts\uvicorn.exe"'   ← actual
 ```
 
-Every `.exe` in `venv\Scripts\` is a small launcher stub with the absolute path
+Every `.exe` in `venv\Scripts\Activate.ps1` is a small launcher stub with the absolute path
 of its interpreter **compiled into it** at creation time. Move the venv and they
 all break at once — `uvicorn`, `alembic`, `pip`, `pytest`, the lot. Activation
 still appears to succeed, which is what makes this confusing: `(venv)` shows in
