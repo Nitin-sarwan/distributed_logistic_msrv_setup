@@ -44,12 +44,25 @@ class Settings(BaseSettings):
     # a spinner, so a slow answer is a failed one.
     pricing_service_timeout_seconds: float = 2.0
 
-    # ── Payment, until the Payment service exists ─────────────────────────
+    # ── Live tracking ─────────────────────────────────────────────────────
     #
-    # True lets `POST /orders/{id}/confirm` authorise its own payment, so the
-    # flow reaches CONFIRMED without a provider. MUST be false anywhere real:
-    # it is, literally, free deliveries.
-    payment_autoconfirm: bool = True
+    # The driver's position is read from partnerServices on each tracking poll.
+    # Short timeout: a customer's map refreshing a few seconds late is fine, a
+    # page hanging on it is not.
+    partner_service_url: str = "http://127.0.0.1:8002"
+    partner_service_timeout_seconds: float = 2.0
+
+    # A position older than this is shown as "last seen", not as live. The app
+    # heartbeats every 60s, so three missed beats means the phone is not
+    # reporting.
+    tracking_stale_seconds: int = 180
+
+    # ── Payment ───────────────────────────────────────────────────────────
+    #
+    # Opened on every confirm. Whether online payments are simulated, and the
+    # UPI ID drivers show, are paymentServices' settings, not this service's.
+    payment_service_url: str = "http://127.0.0.1:8007"
+    payment_service_timeout_seconds: float = 2.0
 
     # ── What to do when Dispatch finds nobody ─────────────────────────────
     #

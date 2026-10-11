@@ -168,6 +168,20 @@ class PartnerPublicResponse(BaseModel):
     rating_count: int
 
 
+class PartnerLocation(BaseModel):
+    """Where a partner last said they were, and nothing else.
+
+    Its own shape rather than a field on PartnerPublicResponse, which leaves
+    coordinates out on purpose. Only Order asks for this, and only for a partner
+    on one of its active deliveries — see orderServices' tracking route.
+    """
+
+    partner_id: int
+    latitude: float | None
+    longitude: float | None
+    updated_at: datetime | None
+
+
 class PartnerUpdate(BaseModel):
     """Partial update of a partner's own profile.
 

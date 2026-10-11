@@ -58,6 +58,10 @@ SERVICE_ROUTES: dict[str, str] = {
     # only Order may ask for one, over /internal/pricing, which this table does
     # not route.
     "/api/pricing": settings.pricing_service_url,
+    # The driver recording cash or showing a UPI QR at the door. Nested under
+    # the driver's prefix for the same reason as their notifications: longest
+    # prefix wins, so this reaches paymentServices with the partner cookie.
+    "/api/deliveries/payments": settings.payment_service_url,
 }
 
 # Which HttpOnly cookie carries the credential for each service.
@@ -90,6 +94,7 @@ ROUTE_COOKIES: dict[str, str] = {
     # Both pricing endpoints are public, so — as with /api/geo — this is only
     # read for a path that does not exist, which must answer 401, not KeyError.
     "/api/pricing": SESSION_COOKIE_NAME,
+    "/api/deliveries/payments": PARTNER_SESSION_COOKIE_NAME,
 }
 
 # Reachable without a token. Everything else is rejected at the edge.
@@ -234,6 +239,12 @@ app.add_middleware(
         "X-Token",         # the alternate credential form extract_token accepts
         "X-Signature",     # optional, recorded on the session document
         "X-Requested-With",
+        # Required by POST /api/orders. Missing from this list, the browser's
+        # preflight is refused and no order can be booked from the web app at
+        # all, while curl (which sends no preflight) works fine.
+        "Idempotency-Key",
+        "X-Correlation-Id",
+        "X-Request-Id",
     ],
     # Cache the preflight so the browser stops re-asking before every request.
     max_age=600,

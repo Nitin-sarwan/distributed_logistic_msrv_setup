@@ -43,7 +43,7 @@ wired.
 | order | **Built** | State machine, address snapshots, outbox, and consumers for `partner.assigned` and `dispatch.*`. Pricing and Payment still stubbed inside it |
 | dispatch | **Built** | The offer loop: consume `order.confirmed`, search, offer one at a time with a TTL, claim on 409, emit `partner.assigned` |
 | pricing | **Built** | Rate card per vehicle, public estimates, stored binding quotes. Order calls it synchronously. See [PRICING_SERVICE.md](PRICING_SERVICE.md) |
-| payment | **Stubbed inside order** | Auto-authorises in development. `PAYMENT_AUTOCONFIRM` |
+| payment | **Built** | Online (simulated until a provider) or on delivery by cash / UPI QR; settles orders on `payment.captured`. See [PAYMENT_SERVICE.md](PAYMENT_SERVICE.md) |
 | location | **Missing, and deferrable** | Partner positions live in `partners.current_latitude/longitude`. Extract when GPS volume justifies a separate store |
 | notification | **Built** | Consumes eight event types, renders templates, stores a feed, honours preferences. Email and push are logging stubs |
 | audit / analytics | **Missing** | Cheap now: wildcard consumers on a topic that already carries real traffic |

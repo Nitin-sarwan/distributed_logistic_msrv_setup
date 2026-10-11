@@ -35,7 +35,12 @@ services:
       # is the one clients reconnect to after the initial metadata fetch, so a
       # broker advertising "kafka:9092" hands the host a name it cannot resolve,
       # and one advertising "127.0.0.1:9092" points containers at themselves.
-      KAFKA_LISTENERS: HOST://0.0.0.0:9092,DOCKER://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      #
+      # CONTROLLER binds to localhost, not 0.0.0.0: it is never advertised, so
+      # Kafka derives its advertised address from this line, and 3.9 refuses to
+      # start with 0.0.0.0 there. The controller only talks to itself (see
+      # QUORUM_VOTERS above), so localhost is exactly right.
+      KAFKA_LISTENERS: HOST://0.0.0.0:9092,DOCKER://0.0.0.0:29092,CONTROLLER://localhost:9093
       KAFKA_ADVERTISED_LISTENERS: HOST://127.0.0.1:9092,DOCKER://kafka:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: HOST:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
@@ -81,15 +86,16 @@ services:
       kafka:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
-    command: |
-      "
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
-        --topic order-events --partitions 3 --replication-factor 1
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
-        --topic order-events.dlq --partitions 1 --replication-factor 1
-      echo '--- topics ---'
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
-      "
+    # One command per line and no surrounding quotes: the block is handed to
+    # `sh -c` as-is, and wrapping it in quotes or splitting a command with `\`
+    # leaves sh running half a command line.
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic order-events --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic order-events.dlq --partitions 1 --replication-factor 1
+        echo '--- topics ---'
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
 
   # Optional. Comment it out if you do not want a second container: nothing
   # depends on it. http://localhost:8080 shows topics, partitions, consumer

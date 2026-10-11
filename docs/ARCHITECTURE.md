@@ -135,6 +135,7 @@ Alembic history — five databases, five histories:
 | `dispatch_db` | dispatchServices | `migration_dispatch/` | `alembic_dispatch.ini` |
 | `notification_db` | notificationServices | `migration_notification/` | `alembic_notification.ini` |
 | `pricing_db` | pricingServices | `migration_pricing/` | `alembic_pricing.ini` |
+| `payment_db` | paymentServices | `migration_payment/` | `alembic_payment.ini` |
 
 ### Service → Mongo (shared)
 
@@ -264,6 +265,7 @@ CREATE DATABASE order_db;
 CREATE DATABASE dispatch_db;
 CREATE DATABASE notification_db;
 CREATE DATABASE pricing_db;
+CREATE DATABASE payment_db;
 
 # 4. Apply migrations — one history per database, so five commands
 alembic upgrade head
@@ -272,6 +274,7 @@ alembic -c alembic_order.ini upgrade head
 alembic -c alembic_dispatch.ini upgrade head
 alembic -c alembic_notification.ini upgrade head
 alembic -c alembic_pricing.ini upgrade head
+alembic -c alembic_payment.ini upgrade head
 
 # 5. Confirm
 alembic current                              # -> a1c4e07b92d3 (head)
@@ -347,7 +350,12 @@ uvicorn src.services.pricingServices.main:app --port 8006 --reload
 ```
 
 ```powershell
-# Terminal 7 — the gateway
+# Terminal 7 — paymentServices     + outbox relay, + Kafka consumer
+uvicorn src.services.paymentServices.main:app --port 8007 --reload
+```
+
+```powershell
+# Terminal 8 — the gateway
 uvicorn src.gateway.main:app --port 8000 --reload
 ```
 
@@ -431,6 +439,7 @@ OpenAPI schema of its own:
 | 8004 | dispatchServices (`/api/dispatch`, `/internal/dispatch/*`) |
 | 8005 | notificationServices (`/api/notifications`, `/api/deliveries/notifications`) |
 | 8006 | pricingServices (`/api/pricing` public, `/internal/pricing/*`) |
+| 8007 | paymentServices (`/api/deliveries/payments` for drivers, `/internal/payments/*`) |
 | 9092 | Kafka — in Docker, the HOST listener |
 | 8080 | Kafka UI — optional, in Docker |
 | 5433 | PostgreSQL 18 |
@@ -582,7 +591,7 @@ verification and a one-active-per-partner invariant, ratings, suspension, and
 the `/internal` availability search Dispatch calls.
 
 **orderServices** — the order state machine, address snapshotting from User,
-binding quotes from Pricing, stubbed payment, the customer and partner endpoints, an outbox, and
+binding quotes from Pricing, payment via paymentServices, the customer and partner endpoints, an outbox, and
 consumers for `partner.assigned`, `dispatch.search_started` and
 `dispatch.search_failed`. See [ORDER_SERVICE.md](ORDER_SERVICE.md).
 
@@ -601,6 +610,10 @@ where the RabbitMQ workers will go). See
 every vehicle, and binding stored quotes for Order, refusing parcels too heavy
 for the vehicle. See [PRICING_SERVICE.md](PRICING_SERVICE.md).
 
+**paymentServices** — pay online (simulated until a provider is connected) or
+on delivery by cash or a UPI QR the driver shows; settles delivered orders on
+`payment.captured`. See [PAYMENT_SERVICE.md](PAYMENT_SERVICE.md).
+
 **The event spine** — Kafka in `docker-compose.yml`, one topic keyed by
 `order_id`, the transactional outbox and its relay in every producer, and
 `processed_events` deduplication in every consumer. See [EVENTS.md](EVENTS.md).
@@ -614,7 +627,7 @@ with revocation and an `app_type` discriminator, the event contracts in
 
 Not built yet: `PATCH /profile` for name and phone, email delivery for password
 resets, refresh-token rotation, rate limiting, session listing, KYC document
-upload, a real Payment service, RabbitMQ and the email/push workers,
+upload, a real payment provider (online payments and verified UPI), RabbitMQ and the email/push workers,
 live tracking, Audit and Analytics, tests.
 
 Known leftovers: `src/main.py` and `src/database/connection.py` are the legacy

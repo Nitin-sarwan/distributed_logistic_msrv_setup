@@ -90,10 +90,12 @@ class PartnerService:
             email=payload.email,
             password_hash=hash_password(payload.password),
             token_secret=secrets.token_hex(32),
+            # Unverified unless PARTNER_AUTO_VERIFY says to skip the check.
+            is_verified=settings.partner_auto_verify,
         )
-        # Everything else takes its column default: OFFLINE, unverified, rating
-        # 5.0 over zero samples. A new partner is deliberately invisible to
-        # Dispatch until operations verifies them.
+        # Everything else takes its column default: OFFLINE, rating 5.0 over
+        # zero samples. Without auto-verify, a new partner is deliberately
+        # invisible to Dispatch until operations verifies them.
         return self.partner_repository.create(partner)
 
     def create_partner_session(self, request, partner: Partner) -> dict:

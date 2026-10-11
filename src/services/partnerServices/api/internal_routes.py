@@ -25,6 +25,7 @@ from src.services.partnerServices.api.schema import (
     AssignStatusUpdate,
     AvailablePartner,
     PartnerDetail,
+    PartnerLocation,
     PartnerPublicResponse,
     RatingCreate,
     SuspensionDecision,
@@ -128,6 +129,34 @@ def get_partner(
     if detail is None:
         raise PARTNER_NOT_FOUND
     return detail
+
+
+@router.get(
+    "/{partner_id}/location",
+    response_model=PartnerLocation,
+    status_code=status.HTTP_200_OK,
+)
+def get_partner_location(
+    partner_id: int,
+    service: PartnerService = Depends(get_partner_service),
+):
+    """The partner's last heartbeat, for live tracking.
+
+    Answers with nulls rather than 404 when they have never sent one — the
+    partner exists, there is just nothing to show yet. Deciding *whether* a
+    customer may see this is Order's job: it only asks while the partner is on
+    that customer's delivery.
+    """
+    detail = service.get_detail(partner_id)
+    if detail is None:
+        raise PARTNER_NOT_FOUND
+    partner = detail["partner"]
+    return PartnerLocation(
+        partner_id=partner.id,
+        latitude=partner.current_latitude,
+        longitude=partner.current_longitude,
+        updated_at=partner.location_updated_at,
+    )
 
 
 @router.patch(

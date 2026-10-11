@@ -64,6 +64,13 @@ class Settings(BaseSettings):
     # the check, which is acceptable only on a local machine.
     internal_api_key: str = ""
 
+    # Skip document checks: a new partner is verified at registration, and a new
+    # vehicle is cleared on creation (and put on the road if they have none).
+    # There is no operations screen yet, so without this nobody could ever go
+    # online. MUST be false anywhere real — it lets anyone with a phone number
+    # take deliveries.
+    partner_auto_verify: bool = True
+
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",

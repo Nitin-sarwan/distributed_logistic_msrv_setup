@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 
 from src.services.partnerServices.api.schema import VehicleCreate, VehicleUpdate
+from src.services.partnerServices.config import settings
 from src.services.partnerServices.models.partner_model import Partner
 from src.services.partnerServices.models.vehicle_model import Vehicle
 from src.services.partnerServices.repositories.partner_repositories import (
@@ -61,10 +62,25 @@ class VehicleService:
             capacity=payload.capacity,
             model_name=payload.model_name,
             # PENDING by default. A partner cannot put a vehicle on the road by
-            # adding it — operations has to look at the papers first.
-            status=VehicleStatus.PENDING.value,
+            # adding it — operations has to look at the papers first. Under
+            # PARTNER_AUTO_VERIFY it starts cleared (INACTIVE) instead.
+            status=(
+                VehicleStatus.INACTIVE.value
+                if settings.partner_auto_verify
+                else VehicleStatus.PENDING.value
+            ),
         )
-        return self.vehicle_repository.create(vehicle)
+        vehicle = self.vehicle_repository.create(vehicle)
+
+        # With nothing else to drive, a cleared vehicle is obviously the one in
+        # use. Making the partner tap "activate" first is a step with no choice
+        # in it.
+        if settings.partner_auto_verify and (
+            self.vehicle_repository.find_active_for_partner(partner.id) is None
+        ):
+            vehicle = self.vehicle_repository.set_active(vehicle)
+
+        return vehicle
 
     def update_vehicle(
         self, partner: Partner, vehicle_id: int, payload: VehicleUpdate
