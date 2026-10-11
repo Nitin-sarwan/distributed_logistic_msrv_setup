@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     dispatch_service_url: str = "http://127.0.0.1:8004"
     notification_service_url: str = "http://127.0.0.1:8005"
     pricing_service_url: str = "http://127.0.0.1:8006"
+    payment_service_url: str = "http://127.0.0.1:8007"
     gateway_timeout_seconds: float = 30.0
 
     # Browser origins allowed to call the gateway, comma separated.

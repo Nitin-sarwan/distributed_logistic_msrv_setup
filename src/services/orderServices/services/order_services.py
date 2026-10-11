@@ -15,9 +15,14 @@ from decimal import Decimal
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.services.orderServices.clients import payment_client, pricing_client
+from src.services.orderServices.clients import (
+    partner_client,
+    payment_client,
+    pricing_client,
+)
 from src.services.orderServices.clients.user_client import ResolvedAddress, fetch_address
 from src.services.orderServices.config import settings
+from src.services.orderServices.domain.geo import haversine_km
 from src.services.orderServices.domain.states import OrderStatus, is_cancellable
 from src.services.orderServices.events import payloads, publisher
 from src.services.orderServices.models.order_model import Order
@@ -29,6 +34,15 @@ from src.services.orderServices.utils.exceptions import (
 from src.services.orderServices.utils.reference import generate_public_ref
 
 logger = logging.getLogger(__name__)
+
+
+# Between assignment and hand-over: the only window in which a customer may see
+# where their driver is.
+TRACKABLE_STATUSES = (
+    OrderStatus.PARTNER_ASSIGNED,
+    OrderStatus.PICKED_UP,
+    OrderStatus.IN_TRANSIT,
+)
 
 
 class OrderService:
@@ -53,6 +67,56 @@ class OrderService:
         order = self.get_order(customer_id, order_id)
         return self.repository.history(order.id)
 
+    def tracking(self, customer_id: int, order_id: int) -> dict:
+        """Where this order's driver is, if the customer may know.
+
+        The privacy rule lives here, not in partnerServices: a customer sees a
+        driver's position only while that driver is on *their* order — from
+        assignment until the goods are handed over. Before that there is no
+        driver to show; after it the driver is somebody else's business. The
+        order id is the key, so there is no route that takes a partner id and
+        nothing that can be walked.
+        """
+        from datetime import datetime, timezone
+
+        order = self.get_order(customer_id, order_id)
+        status = OrderStatus(order.status)
+
+        if status in (OrderStatus.DELIVERED, OrderStatus.SETTLED, OrderStatus.CANCELLED):
+            return {"available": False, "reason": "finished"}
+        if status not in TRACKABLE_STATUSES or order.partner_id is None:
+            return {"available": False, "reason": "not_assigned"}
+
+        position = partner_client.fetch_position(order.partner_id)
+        if position is None:
+            return {"available": False, "reason": "no_position"}
+
+        # Before pickup the driver is heading to the sender; after, to the drop.
+        if status is OrderStatus.PARTNER_ASSIGNED:
+            heading_to, target = "pickup", (order.pickup_latitude, order.pickup_longitude)
+        else:
+            heading_to, target = "drop", (order.drop_latitude, order.drop_longitude)
+
+        age = (
+            (datetime.now(timezone.utc) - position.updated_at).total_seconds()
+            if position.updated_at
+            else None
+        )
+        return {
+            "available": True,
+            "latitude": position.latitude,
+            "longitude": position.longitude,
+            "updated_at": position.updated_at,
+            "is_stale": age is None or age > settings.tracking_stale_seconds,
+            "heading_to": heading_to,
+            "distance_km": round(
+                haversine_km(
+                    position.latitude, position.longitude, float(target[0]), float(target[1])
+                ),
+                2,
+            ),
+        }
+
     # ── Create ────────────────────────────────────────────────────────────
 
     def create_order(
@@ -64,6 +128,7 @@ class OrderService:
         weight_kg: Decimal,
         description: str | None,
         idempotency_key: str,
+        payment_method: str = "online",
         correlation_id: str | None = None,
     ) -> Order:
         """Snapshot both ends, quote the fare, and record the order.
@@ -112,6 +177,7 @@ class OrderService:
             package_weight_kg=weight_kg,
             package_description=description,
             vehicle_type=vehicle_type,
+            payment_method=payment_method,
             distance_km=quote.distance_km,
             quote_id=quote.quote_id,
             quoted_amount=quote.amount,
@@ -161,11 +227,12 @@ class OrderService:
     def confirm_order(
         self, customer_id: int, order_id: int, correlation_id: str | None = None
     ) -> Order:
-        """The customer accepts the fare and pays.
+        """The customer accepts the fare and chooses how to pay.
 
-        Passes through PAYMENT_PENDING even while payment is stubbed, so the
-        state machine does not change shape when the real service lands — only
-        who answers changes.
+        Opens the order's payment with Payment, synchronously. Pay-on-delivery
+        is confirmed straight away — a driver is sought, and the money is
+        collected at the door. Online is confirmed only if the payment is
+        already paid; otherwise the order waits at PAYMENT_PENDING.
         """
         order = self.get_order(customer_id, order_id)
 
@@ -174,10 +241,16 @@ class OrderService:
                 "This order has already been confirmed or cancelled"
             )
 
-        intent = payment_client.create_intent(
-            order.id, order.quoted_amount, order.currency
+        payment = payment_client.open_payment(
+            order_id=order.id,
+            public_ref=order.public_ref,
+            customer_id=order.customer_id,
+            amount=order.quoted_amount,
+            currency=order.currency,
+            method=order.payment_method,
         )
-        order.payment_intent_id = intent.intent_id
+        if payment.status == payment_client.PAID:
+            order.payment_status = "paid"
         order.status = OrderStatus.PAYMENT_PENDING.value
         self.repository.record_transition(
             order.id,
@@ -186,7 +259,7 @@ class OrderService:
             actor="customer",
         )
 
-        if intent.authorized:
+        if payment.confirms_order:
             self._mark_confirmed(order, correlation_id)
 
         self.db.commit()
@@ -194,10 +267,10 @@ class OrderService:
         return order
 
     def _mark_confirmed(self, order: Order, correlation_id: str | None) -> None:
-        """What consuming `payment.authorized` will do, once that event exists.
+        """PAYMENT_PENDING -> CONFIRMED, and tell Dispatch.
 
-        Kept as its own method so the Kafka handler added in the next phase
-        calls exactly this, and confirmation cannot drift into two versions.
+        Kept as its own method so a future `payment.authorized` handler (a real
+        provider confirming an online payment later) calls exactly this.
         """
         from datetime import datetime, timezone
 
@@ -371,10 +444,51 @@ class DeliveryService:
             payloads.order_delivered(order),
             correlation_id,
         )
+        # Already paid (online, or collected before the driver tapped
+        # Delivered): goods and money are both done, so it is settled now.
+        if order.payment_status == "paid":
+            self._settle(order, event_id=None)
 
         self.db.commit()
         self.db.refresh(order)
         return order
+
+    # ── What Payment causes ───────────────────────────────────────────────
+
+    def apply_payment_captured(self, order_id: int, event_id: str | None = None) -> Order:
+        """The money arrived. Stages; does not commit.
+
+        Settles the order if the goods have arrived too. If not yet — the
+        driver collected before tapping Delivered — `mark_delivered` settles it
+        when they do. Idempotent: a redelivery finds it paid and changes nothing.
+        """
+        order = self.repository.find_by_id(order_id)
+        if order is None:
+            raise OrderNotFoundError()
+
+        order.payment_status = "paid"
+        if order.status == OrderStatus.DELIVERED.value:
+            self._settle(order, event_id)
+        return order
+
+    def apply_payment_refunded(self, order_id: int) -> Order:
+        """The money went back after a cancellation. Stages; does not commit."""
+        order = self.repository.find_by_id(order_id)
+        if order is None:
+            raise OrderNotFoundError()
+        order.payment_status = "refunded"
+        return order
+
+    def _settle(self, order: Order, event_id: str | None) -> None:
+        """DELIVERED -> SETTLED: the goods arrived and the money moved."""
+        order.status = OrderStatus.SETTLED.value
+        self.repository.record_transition(
+            order.id,
+            OrderStatus.DELIVERED.value,
+            OrderStatus.SETTLED,
+            actor="payment",
+            caused_by_event_id=event_id,
+        )
 
     # ── What Dispatch causes ──────────────────────────────────────────────
     #
@@ -568,8 +682,3 @@ class DeliveryService:
             correlation_id,
         )
         return order
-
-
-def payment_is_stubbed() -> bool:
-    """For the health endpoint, so a deployment cannot hide free deliveries."""
-    return settings.payment_autoconfirm

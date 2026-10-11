@@ -1,7 +1,7 @@
 import logging
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from src.services.orderServices.api.dependencies import (
@@ -14,6 +14,7 @@ from src.services.orderServices.api.schema import (
     OrderEndpoint,
     OrderResponse,
     StatusHistoryEntry,
+    TrackingResponse,
     to_order_response,
 )
 from src.services.orderServices.clients.user_client import ResolvedAddress, fetch_address
@@ -24,6 +25,7 @@ from src.services.orderServices.utils.exceptions import (
     AddressServiceUnavailableError,
     InvalidTransitionError,
     OrderNotFoundError,
+    PaymentServiceUnavailableError,
     PricingServiceUnavailableError,
     QuoteRefusedError,
 )
@@ -101,6 +103,7 @@ def create_order(
             vehicle_type=payload.vehicle_type,
             weight_kg=Decimal(payload.weight_kg),
             description=payload.description,
+            payment_method=payload.payment_method,
             idempotency_key=idempotency_key,
             correlation_id=correlation_id,
         )
@@ -164,6 +167,28 @@ def get_history(
         ) from error
 
 
+@router.get("/{order_id}/tracking", response_model=TrackingResponse)
+def get_tracking(
+    order_id: int,
+    response: Response,
+    customer_id: int = Depends(get_current_customer_id),
+    service: OrderService = Depends(get_order_service),
+):
+    """Where the driver on this order is, polled by the order page.
+
+    Polling, not a socket, for now: PLATFORM_WORKFLOW.md leaves the transport
+    open, and the shape of this answer does not change when it is decided.
+    """
+    # Live data about a person — never from a cache.
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return TrackingResponse(**service.tracking(customer_id, order_id))
+    except OrderNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=error.message
+        ) from error
+
+
 @router.post("/{order_id}/confirm", response_model=OrderResponse)
 def confirm_order(
     order_id: int,
@@ -187,6 +212,10 @@ def confirm_order(
     except InvalidTransitionError as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=error.message
+        ) from error
+    except PaymentServiceUnavailableError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=error.message
         ) from error
 
     return to_order_response(order)

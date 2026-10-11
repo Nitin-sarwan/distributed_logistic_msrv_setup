@@ -25,6 +25,8 @@ thousand people read.
 from typing import Any, Callable, NamedTuple
 
 from src.common.events.types import (
+    PAYMENT_CAPTURED,
+    PAYMENT_REFUNDED,
     DISPATCH_SEARCH_FAILED,
     ORDER_CANCELLED,
     ORDER_CONFIRMED,
@@ -117,7 +119,7 @@ def _order_created(data: dict[str, Any]) -> list[Message]:
             recipient_id=int(data["customer_id"]),
             category=Category.ORDER,
             title=f"Booking {_ref(data)} created",
-            body=f"{_route(data)}. We are working out your fare.",
+            body=f"{_route(data)}. Check the fare and confirm to book it.",
             channels=(Channel.IN_APP,),
             action_path=_order_path(data),
         )
@@ -361,6 +363,45 @@ def _partner_offered(data: dict[str, Any]) -> list[Message]:
     ]
 
 
+# ── Payment templates ─────────────────────────────────────────────────────
+
+_PAID_BY = {"online": "online", "cash": "in cash", "upi": "over UPI"}
+
+
+def _payment_captured(data: dict[str, Any]) -> list[Message]:
+    """A receipt, in the feed. In-app only: the customer is usually standing in
+    front of the driver who just took the money."""
+    how = _PAID_BY.get(data.get("collected_via") or "", "")
+    return [
+        Message(
+            recipient_type=RecipientType.CUSTOMER,
+            recipient_id=int(data["customer_id"]),
+            category=Category.PAYMENT,
+            title=f"Payment received for {_ref(data)}",
+            body=f"{_money(data.get('amount'), data.get('currency', 'INR'))} paid {how}.".replace("  ", " "),
+            channels=(Channel.IN_APP,),
+            action_path=_order_path(data),
+        )
+    ]
+
+
+def _payment_refunded(data: dict[str, Any]) -> list[Message]:
+    return [
+        Message(
+            recipient_type=RecipientType.CUSTOMER,
+            recipient_id=int(data["customer_id"]),
+            category=Category.PAYMENT,
+            title=f"Refund for {_ref(data)}",
+            body=(
+                f"{_money(data.get('amount'), data.get('currency', 'INR'))} is on its way "
+                "back to you for the cancelled delivery."
+            ),
+            channels=(Channel.IN_APP, Channel.EMAIL),
+            action_path=_order_path(data),
+        )
+    ]
+
+
 # ── The registry ──────────────────────────────────────────────────────────
 #
 # One entry per event type this service reacts to. An event absent from here
@@ -384,6 +425,8 @@ TEMPLATES: dict[str, Callable[[dict[str, Any]], list[Message]]] = {
     ORDER_PICKED_UP: _order_picked_up,
     ORDER_DELIVERED: _order_delivered,
     ORDER_CANCELLED: _order_cancelled,
+    PAYMENT_CAPTURED: _payment_captured,
+    PAYMENT_REFUNDED: _payment_refunded,
 }
 
 

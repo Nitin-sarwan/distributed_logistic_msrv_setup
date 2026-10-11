@@ -95,6 +95,16 @@ class Order(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # ── Payment snapshot ──────────────────────────────────────────────────
+    # The method is the customer's choice at booking. The status is copied from
+    # Payment's events — Order never decides money moved, it is told.
+    payment_method: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="online", server_default="online"
+    )
+    payment_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending"
+    )
+
     # Owned by Payment. Held here only so support can join the two by hand.
     payment_intent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
@@ -139,6 +149,12 @@ class Order(Base):
             "customer_id", "idempotency_key", name="uq_orders_idempotency"
         ),
         CheckConstraint(f"status IN ({STATUS_VALUES})", name="ck_orders_status"),
+        CheckConstraint(
+            "payment_method IN ('online', 'on_delivery')", name="ck_orders_payment_method"
+        ),
+        CheckConstraint(
+            "payment_status IN ('pending', 'paid', 'refunded')", name="ck_orders_payment_status"
+        ),
         CheckConstraint("package_weight_kg > 0", name="ck_orders_weight_positive"),
         CheckConstraint(
             "pickup_latitude BETWEEN -90 AND 90 AND drop_latitude BETWEEN -90 AND 90",

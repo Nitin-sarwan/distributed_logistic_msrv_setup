@@ -5,6 +5,7 @@ a customer id in a body is a field an attacker gets to choose.
 """
 
 from datetime import datetime
+from typing import Literal
 from decimal import ROUND_HALF_UP, Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -75,6 +76,8 @@ class OrderEndpoint(BaseModel):
 class CreateOrder(BaseModel):
     pickup: OrderEndpoint
     drop: OrderEndpoint
+    # Paid up front, or to the driver at drop-off.
+    payment_method: Literal["online", "on_delivery"] = "online"
     vehicle_type: str = Field(max_length=20)
     weight_kg: Decimal = Field(gt=0, le=10_000)
     description: str | None = Field(default=None, max_length=500)
@@ -128,6 +131,9 @@ class OrderResponse(BaseModel):
     currency: str
     quote_expires_at: datetime | None
 
+    payment_method: str
+    payment_status: str
+
     partner_id: int | None
     partner_name: str | None
     partner_phone: str | None
@@ -139,6 +145,29 @@ class OrderResponse(BaseModel):
     delivered_at: datetime | None
     cancelled_at: datetime | None
     cancellation_reason: str | None
+
+
+class TrackingResponse(BaseModel):
+    """The driver's position for one order, or why there is none.
+
+    `available` false is a normal answer — before a driver is assigned, after
+    delivery, or while their phone has not reported — so it is a 200 with a
+    `reason` the app can show, never an error.
+    """
+
+    available: bool
+    # not_assigned | finished | no_position | unavailable
+    reason: str | None = None
+
+    latitude: float | None = None
+    longitude: float | None = None
+    updated_at: datetime | None = None
+    is_stale: bool = False
+
+    # Which end the driver is heading for, and how far away it is in a straight
+    # line — labelled as an estimate in the app.
+    heading_to: str | None = None
+    distance_km: float | None = None
 
 
 class StatusHistoryEntry(BaseModel):
@@ -183,6 +212,8 @@ def to_order_response(order) -> OrderResponse:
         quoted_amount=str(order.quoted_amount) if order.quoted_amount is not None else None,
         currency=order.currency,
         quote_expires_at=order.quote_expires_at,
+        payment_method=order.payment_method,
+        payment_status=order.payment_status,
         partner_id=order.partner_id,
         partner_name=order.partner_name,
         partner_phone=order.partner_phone,

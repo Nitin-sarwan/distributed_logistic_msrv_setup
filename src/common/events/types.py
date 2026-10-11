@@ -60,6 +60,14 @@ PARTNER_REJECTED: Final = "partner.rejected"
 PARTNER_ASSIGNED: Final = "partner.assigned"
 PARTNER_RELEASED: Final = "partner.released"
 
+# ── Produced by paymentServices ───────────────────────────────────────────
+#
+# Captured means the money is ours: paid online, or collected by the driver in
+# cash or over UPI. It is what moves a delivered order to settled. Refunded is
+# Payment's leg of the cancellation saga for an order that was paid up front.
+PAYMENT_CAPTURED: Final = "payment.captured"
+PAYMENT_REFUNDED: Final = "payment.refunded"
+
 # Every type the platform knows about. A consumer registering a handler for a
 # string absent from this set is a startup error — see consumer.py.
 ALL_EVENT_TYPES: Final[frozenset[str]] = frozenset(
@@ -75,6 +83,8 @@ ALL_EVENT_TYPES: Final[frozenset[str]] = frozenset(
         PARTNER_REJECTED,
         PARTNER_ASSIGNED,
         PARTNER_RELEASED,
+        PAYMENT_CAPTURED,
+        PAYMENT_REFUNDED,
     }
 )
 
@@ -87,3 +97,4 @@ ALL_EVENT_TYPES: Final[frozenset[str]] = frozenset(
 GROUP_ORDER: Final = "order-service"
 GROUP_DISPATCH: Final = "dispatch-service"
 GROUP_NOTIFICATION: Final = "notification-service"
+GROUP_PAYMENT: Final = "payment-service"

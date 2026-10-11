@@ -39,11 +39,6 @@ async def lifespan(app: FastAPI):
     check_mongo_connection()
     ensure_indexes()
 
-    if settings.payment_autoconfirm:
-        logger.warning(
-            "PAYMENT_AUTOCONFIRM is on — every order authorises its own payment. "
-            "Development only."
-        )
     if not settings.internal_api_key:
         logger.warning(
             "INTERNAL_API_KEY is not set — /internal/orders/* is unauthenticated, "
@@ -88,8 +83,6 @@ def health():
     return {
         "status": "ok",
         "service": "orderServices",
-        # Surfaced so a deployment cannot quietly be giving deliveries away.
-        "payment_stubbed": settings.payment_autoconfirm,
         # Surfaced because a false here means events are piling up in the outbox
         # and no delivery will ever be dispatched — a condition that otherwise
         # looks like everything working.

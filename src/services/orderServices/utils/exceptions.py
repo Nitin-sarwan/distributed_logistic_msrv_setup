@@ -60,6 +60,12 @@ class QuoteRefusedError(OrderError):
     message = "This delivery cannot be priced as requested"
 
 
+class PaymentServiceUnavailableError(OrderError):
+    """Payment could not be reached to open the order's payment. 503."""
+
+    message = "Could not start your payment right now. Please try again."
+
+
 class QuoteExpiredError(OrderError):
     message = "That fare estimate has expired. Please get a new one."
 

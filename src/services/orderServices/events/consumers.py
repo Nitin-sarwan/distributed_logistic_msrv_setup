@@ -28,6 +28,8 @@ from src.common.events.types import (
     DISPATCH_SEARCH_STARTED,
     GROUP_ORDER,
     PARTNER_ASSIGNED,
+    PAYMENT_CAPTURED,
+    PAYMENT_REFUNDED,
 )
 from src.services.orderServices.database.connection import SessionLocal
 from src.services.orderServices.models.processed_event_model import ProcessedEvent
@@ -96,6 +98,19 @@ def handle_search_failed(db: Session, envelope: dict[str, Any]) -> None:
     )
 
 
+def handle_payment_captured(db: Session, envelope: dict[str, Any]) -> None:
+    """The money arrived — online, or collected by the driver. Settle if delivered."""
+    DeliveryService(db).apply_payment_captured(
+        order_id=_order_id(envelope),
+        event_id=envelope["event_id"],
+    )
+
+
+def handle_payment_refunded(db: Session, envelope: dict[str, Any]) -> None:
+    """The money went back after a cancellation. Shown on the order."""
+    DeliveryService(db).apply_payment_refunded(order_id=_order_id(envelope))
+
+
 def _guarded(handler):
     """Turn the two domain errors that are not failures into no-ops.
 
@@ -147,4 +162,6 @@ def build_consumer() -> EventConsumer:
     consumer.on(PARTNER_ASSIGNED, _guarded(handle_partner_assigned))
     consumer.on(DISPATCH_SEARCH_STARTED, _guarded(handle_search_started))
     consumer.on(DISPATCH_SEARCH_FAILED, _guarded(handle_search_failed))
+    consumer.on(PAYMENT_CAPTURED, _guarded(handle_payment_captured))
+    consumer.on(PAYMENT_REFUNDED, _guarded(handle_payment_refunded))
     return consumer

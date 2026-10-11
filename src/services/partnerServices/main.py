@@ -36,6 +36,11 @@ async def lifespan(app: FastAPI):
             "Acceptable on a local machine only: those endpoints approve KYC and "
             "reassign partners."
         )
+    if settings.partner_auto_verify:
+        logger.warning(
+            "PARTNER_AUTO_VERIFY is on — new partners and vehicles skip document "
+            "checks. Development only."
+        )
 
     yield
     # shutdown
@@ -58,4 +63,9 @@ app.include_router(internal_router)
 @app.get("/health")
 def health():
     # Not under /api, so the gateway's health aggregation reaches it directly.
-    return {"status": "ok", "service": "partnerServices"}
+    return {
+        "status": "ok",
+        "service": "partnerServices",
+        # Surfaced so a deployment cannot quietly be skipping KYC.
+        "auto_verify": settings.partner_auto_verify,
+    }
