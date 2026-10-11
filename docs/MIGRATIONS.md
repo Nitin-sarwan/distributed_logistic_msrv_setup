@@ -5,32 +5,54 @@ file — never through `create_all()` or hand-written SQL against the database.
 
 ---
 
-## 0. Two databases, two histories
+## 0. Five databases, five histories
 
 Each service owns its own database, so each has its own Alembic environment:
 
-| Database | Config file | Scripts | Service |
-| --- | --- | --- | --- |
-| `user_db` | `alembic.ini` (default) | `migration/` | userServices |
-| `partner_db` | `alembic_partner.ini` | `migration_partner/` | partnerServices |
+| Database | Config file | Scripts | Service | Head |
+| --- | --- | --- | --- | --- |
+| `user_db` | `alembic.ini` (default) | `migration/` | userServices | `a1c4e07b92d3` |
+| `partner_db` | `alembic_partner.ini` | `migration_partner/` | partnerServices | `b1f4a72c9e01` |
+| `order_db` | `alembic_order.ini` | `migration_order/` | orderServices | `c3a91d5f7e02` |
+| `dispatch_db` | `alembic_dispatch.ini` | `migration_dispatch/` | dispatchServices | `d5b30f81ac47` |
+| `notification_db` | `alembic_notification.ini` | `migration_notification/` | notificationServices | `e2c81a4d6f30` |
 
-**Every command below takes `-c alembic_partner.ini` when you mean partner_db.**
+**Only `user_db` runs without `-c`. Everything else needs its config file.**
 
 ```powershell
-alembic upgrade head                          # user_db
-alembic -c alembic_partner.ini upgrade head   # partner_db
+alembic upgrade head                               # user_db
+alembic -c alembic_partner.ini upgrade head        # partner_db
+alembic -c alembic_order.ini upgrade head          # order_db
+alembic -c alembic_dispatch.ini upgrade head       # dispatch_db
+alembic -c alembic_notification.ini upgrade head   # notification_db
 ```
 
-They cannot be merged. One `alembic_version` table cannot describe two
-databases, and `target_metadata` is built from exactly one `Base` — if both
+They cannot be merged. One `alembic_version` table cannot describe five
+databases, and `target_metadata` is built from exactly one `Base` — if two
 services shared one, every `--autogenerate` would find the other service's
 tables missing from the database it is pointed at and emit `op.drop_table()` for
 all of them. §6 records what that looks like in practice.
 
-> **Forgetting `-c` is the failure mode to watch for.** Plain `alembic upgrade
-> head` against a `partner_db` connection reports nothing to do and then stamps
-> its `alembic_version` table with *user* revision ids. Nothing errors; the two
-> histories are just quietly wrong from then on.
+> **Forgetting `-c` is the failure mode to watch for**, and it gets worse with
+> every database added. Plain `alembic upgrade head` against a `dispatch_db`
+> connection reports nothing to do and then stamps its `alembic_version` table
+> with *user* revision ids. Nothing errors; the two histories are just quietly
+> wrong from then on.
+
+### Four tables that appear in more than one database
+
+`outbox` and `processed_events` exist in `order_db` and `dispatch_db`;
+`processed_events` also exists in `notification_db`. They are **not** shared
+tables — each is a separate table in a separate database, defined from a shared
+mixin in `src/common/events/models.py`.
+
+The mixin is not a convenience. The relay and the consumer in
+`src/common/events/` are written once against those exact column names and work
+unchanged for any service that mixes them in, so the definitions must not drift.
+A migration that renames a column in one of them breaks the other services'
+relay, not just its own.
+
+Their columns and the reasoning behind each are in [EVENTS.md](EVENTS.md).
 
 ---
 
@@ -81,10 +103,27 @@ migration_partner/
   script.py.mako
   versions/
     b1f4a72c9e01_create_partners_and_vehicles.py
+
+alembic_order.ini            # script_location = migration_order
+migration_order/versions/
+    c3a91d5f7e02_create_orders.py
+
+alembic_dispatch.ini         # script_location = migration_dispatch
+migration_dispatch/versions/
+    d5b30f81ac47_create_dispatch.py
+
+alembic_notification.ini     # script_location = migration_notification
+migration_notification/versions/
+    e2c81a4d6f30_create_notifications.py
 ```
 
-The two `env.py` files are identical but for which `Base` and `settings` they
-import.
+The five `env.py` files are identical but for which `Base` and `settings` they
+import, and which models they import to register on that `Base`.
+
+> **The model imports in `env.py` are load-bearing.** Autogenerate inspects
+> `Base.metadata`, and a model that has not been imported is not on it — so it
+> looks like a table that should be dropped. Every new model file must be added
+> to the `from ...models import (...)` block in its `env.py`.
 
 Two project-specific details in each `env.py`:
 
@@ -100,7 +139,8 @@ This also keeps the password out of a tracked file. Leave the placeholder
 `sqlalchemy.url` in `alembic.ini` alone; it is overridden at runtime.
 
 The database each targets is pinned in that service's own `config.py`
-(`user_db`, `partner_db`), not in `.env`.
+(`user_db`, `partner_db`, `order_db`, `dispatch_db`, `notification_db`), not in
+`.env`. Only host, port and credentials are shared.
 
 ---
 

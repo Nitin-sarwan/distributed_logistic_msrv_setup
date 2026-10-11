@@ -24,6 +24,8 @@ from src.services.orderServices.utils.exceptions import (
     AddressServiceUnavailableError,
     InvalidTransitionError,
     OrderNotFoundError,
+    PricingServiceUnavailableError,
+    QuoteRefusedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,16 +93,29 @@ def create_order(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=error.message
         ) from error
 
-    order = service.create_order(
-        customer_id=customer_id,
-        pickup=pickup,
-        drop=drop,
-        vehicle_type=payload.vehicle_type,
-        weight_kg=Decimal(payload.weight_kg),
-        description=payload.description,
-        idempotency_key=idempotency_key,
-        correlation_id=correlation_id,
-    )
+    try:
+        order = service.create_order(
+            customer_id=customer_id,
+            pickup=pickup,
+            drop=drop,
+            vehicle_type=payload.vehicle_type,
+            weight_kg=Decimal(payload.weight_kg),
+            description=payload.description,
+            idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
+        )
+    except QuoteRefusedError as error:
+        # Pricing will not quote this — too heavy for the vehicle, or a vehicle
+        # not offered. The customer can fix it by choosing again, so it is a
+        # 422 in Pricing's own words rather than a generic failure.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=error.message
+        ) from error
+    except PricingServiceUnavailableError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=error.message
+        ) from error
+
     return to_order_response(order)
 
 

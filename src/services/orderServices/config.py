@@ -33,20 +33,16 @@ class Settings(BaseSettings):
     # a slow answer is a failed one.
     user_service_timeout_seconds: float = 2.0
 
-    # ── Pricing, until the Pricing service exists ─────────────────────────
+    # ── Pricing ───────────────────────────────────────────────────────────
     #
-    # A flat base plus a per-kilometre rate on the straight-line distance. It is
-    # deliberately crude: the point of the stub is that the order flow can be
-    # built and demonstrated before anyone argues about tariffs, and that
-    # deleting it later touches one file.
-    pricing_base_fare: float = 30.0
-    pricing_per_km: float = 12.0
-    pricing_minimum_fare: float = 45.0
-    pricing_currency: str = "INR"
+    # Asked for a binding quote on every order creation. The fare rules, the
+    # rate card and the quote TTL all live in pricingServices now; this service
+    # only knows where to ask and how long to wait.
+    pricing_service_url: str = "http://127.0.0.1:8006"
 
-    # A quote is a price at a moment. Past this, the order must be re-quoted
-    # rather than silently honoured at a stale fare.
-    quote_ttl_minutes: int = 15
+    # Same budget as the address lookup, for the same reason: the customer is on
+    # a spinner, so a slow answer is a failed one.
+    pricing_service_timeout_seconds: float = 2.0
 
     # ── Payment, until the Payment service exists ─────────────────────────
     #
@@ -54,6 +50,18 @@ class Settings(BaseSettings):
     # flow reaches CONFIRMED without a provider. MUST be false anywhere real:
     # it is, literally, free deliveries.
     payment_autoconfirm: bool = True
+
+    # ── What to do when Dispatch finds nobody ─────────────────────────────
+    #
+    # Dispatch reports `dispatch.search_failed`; this decides what the customer
+    # experiences, because that policy belongs to the service that owns the
+    # order rather than to the one that ran the search.
+    #
+    # True cancels the order with a reason, which releases the payment
+    # authorisation and tells the customer to try again. False leaves it in
+    # SEARCHING_PARTNER for an operator to deal with — reasonable only if
+    # someone is actually watching.
+    cancel_on_dispatch_failure: bool = True
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

@@ -36,6 +36,28 @@ SERVICE_ROUTES: dict[str, str] = {
     # Same service, partner-facing. A separate prefix because the cookie that
     # authenticates it is a different one.
     "/api/deliveries": settings.order_service_url,
+    # The driver's offer screen: what is on offer right now, accept, decline.
+    # Partner cookie, like /api/deliveries. There is no customer-facing dispatch
+    # prefix and there must never be one — a customer who could call Dispatch
+    # could dispatch an order they had not paid for.
+    "/api/dispatch": settings.dispatch_service_url,
+    "/api/notifications": settings.notification_service_url,
+    # **Longest prefix wins, and this entry depends on it.** It is more specific
+    # than "/api/deliveries" above, so a request to
+    # /api/deliveries/notifications reaches notificationServices while
+    # everything else under /api/deliveries reaches orderServices.
+    #
+    # It nests under the partner namespace rather than standing alone because
+    # that is what makes the cookie right: notifications for a driver must be
+    # authenticated with the driver's cookie, and this table maps one cookie per
+    # prefix. Deleting this line does not 404 — it silently sends the driver's
+    # feed requests to orderServices, which answers 404 for paths it has never
+    # heard of.
+    "/api/deliveries/notifications": settings.notification_service_url,
+    # Fare estimates and the public rate card. Binding quotes are not here —
+    # only Order may ask for one, over /internal/pricing, which this table does
+    # not route.
+    "/api/pricing": settings.pricing_service_url,
 }
 
 # Which HttpOnly cookie carries the credential for each service.
@@ -58,6 +80,16 @@ ROUTE_COOKIES: dict[str, str] = {
     # why a service that cannot decrypt a token must not settle for a header.
     "/api/orders": SESSION_COOKIE_NAME,
     "/api/deliveries": PARTNER_SESSION_COOKIE_NAME,
+    # Dispatch is the driver's app only. Notifications exist for both, on two
+    # prefixes, because this table maps one cookie per prefix and a browser can
+    # legitimately hold a customer session and a partner session at once —
+    # guessing between them would show one app the other's messages.
+    "/api/dispatch": PARTNER_SESSION_COOKIE_NAME,
+    "/api/notifications": SESSION_COOKIE_NAME,
+    "/api/deliveries/notifications": PARTNER_SESSION_COOKIE_NAME,
+    # Both pricing endpoints are public, so — as with /api/geo — this is only
+    # read for a path that does not exist, which must answer 401, not KeyError.
+    "/api/pricing": SESSION_COOKIE_NAME,
 }
 
 # Reachable without a token. Everything else is rejected at the edge.
@@ -85,6 +117,12 @@ PUBLIC_PATHS: set[str] = {
     # process-wide 1 req/s throttle, and a 24h cache. See geo_routes.py.
     "/api/geo/search",
     "/api/geo/reverse",
+    # What a delivery would cost, asked before signing in for the same reason
+    # as address search. Arithmetic on the caller's own coordinates plus a
+    # published rate card: it writes nothing and calls no third party, so it
+    # needs no quota of its own. A binding quote is internal-only.
+    "/api/pricing/estimate",
+    "/api/pricing/tariffs",
     "/health",
 }
 

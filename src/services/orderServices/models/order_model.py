@@ -85,6 +85,10 @@ class Order(Base):
     currency: Mapped[str] = mapped_column(
         String(3), nullable=False, default="INR", server_default="INR"
     )
+    # Pricing's id for the quote this fare came from. The amount above is the
+    # snapshot; this is the receipt — `GET /internal/pricing/quotes/{id}` shows
+    # the breakdown and the tariff it was computed on.
+    quote_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # A quote is a price at a moment; past this it must be re-quoted rather than
     # silently honoured.
     quote_expires_at: Mapped[datetime | None] = mapped_column(

@@ -45,6 +45,21 @@ class InvalidTransitionError(OrderError):
     message = "This order cannot be changed from its current state"
 
 
+class PricingServiceUnavailableError(OrderError):
+    """Pricing could not be reached, or answered with something other than a
+    price or a refusal. Ours to fix — 503, worth retrying."""
+
+    message = "Could not price your delivery right now. Please try again."
+
+
+class QuoteRefusedError(OrderError):
+    """Pricing will not quote this delivery as asked — a parcel too heavy for
+    the vehicle, or a vehicle type not offered. The customer's to fix — 422,
+    with Pricing's own wording."""
+
+    message = "This delivery cannot be priced as requested"
+
+
 class QuoteExpiredError(OrderError):
     message = "That fare estimate has expired. Please get a new one."
 

@@ -519,21 +519,35 @@ def confirm(self, order: Order, event: Envelope) -> None:
     self.db.commit()          # the order and its announcement, atomically
 ```
 
-The relay is a separate loop — a thread in the service today, its own process
-later:
+The relay is a separate loop — an asyncio task in the service today, its own
+process later. As built it lives in `src/common/events/relay.py`, shared by
+every producing service:
 
 ```python
-rows = db.execute(
-    select(Outbox).where(Outbox.published_at.is_(None))
-    .order_by(Outbox.id).limit(100)
-    .with_for_update(skip_locked=True)      # two relays never fight over a row
-).scalars().all()
+rows = fetch_unpublished(limit=100)         # ordered by id
 
 for row in rows:
-    producer.send(topic_for(row.event_type), key=row.aggregate_id, value=row.payload)
-    row.published_at = now()
-db.commit()
+    try:
+        await producer.send_and_wait(TOPIC, key=row.aggregate_id, value=row.payload)
+    except Exception:
+        record_failure(row)
+        break                # STOP. Later rows may be for the same order, and
+                             # skipping ahead reorders that order's history.
+    published.append(row.id)
+
+mark_published(published)
 ```
+
+Two departures from the sketch, both deliberate:
+
+- **The batch stops at the first failure** rather than carrying on. Skipping a
+  failed row to make progress on later ones would deliver `order.delivered`
+  before `order.picked_up`.
+- **No `FOR UPDATE SKIP LOCKED`.** Two relays for one service — two `--reload`
+  workers overlapping, say — would publish the same rows twice, and that is a
+  duplicate consumers already handle. Locking buys nothing the deduplication
+  table does not already give, and holding a row lock across an `await` on a
+  network call is a worse trade.
 
 **The cost, stated plainly:** a relay can publish and crash before marking the
 row sent, so it republishes. Delivery is at-least-once and duplicates are
@@ -589,15 +603,19 @@ services/order/
     ├── services/                # create_order orchestrates User + Pricing + Payment
     ├── database/
     ├── events/
-    │   ├── envelope.py          # the shape above, built once
+    │   ├── payloads.py          # what each event carries
     │   ├── publisher.py         # writes to outbox — never to Kafka directly
-    │   ├── relay.py             # outbox → Kafka
-    │   └── handlers.py          # the four consumers
+    │   └── consumers.py         # handlers for partner.assigned, dispatch.*
     └── clients/
         ├── user.py              # the one call in this document
         ├── pricing.py
         └── payment.py
 ```
+
+As built, the envelope, the relay and the consumer machinery are **not** in this
+folder — they are in `src/common/events/`, shared by every service on the topic.
+Only what is specific to Order lives here: which events it emits, what they
+carry, and what it does when one arrives.
 
 `clients/` is what makes "what does Order depend on?" a question you answer by
 listing a folder. Three files means three synchronous dependencies — if a fourth
@@ -612,7 +630,19 @@ database, its own migrations) is already respected by the existing services.
 
 ---
 
-## Build order
+## Build order  ✅ complete
+
+> **All six steps below are done.** Kafka is in `docker-compose.yml`, the
+> contracts live in `src/common/events/`, Dispatch exists, and the
+> `order.confirmed` → `partner.assigned` round trip runs with no HTTP between
+> the two services. See [EVENTS.md](EVENTS.md) and
+> [DISPATCH_SERVICE.md](DISPATCH_SERVICE.md).
+>
+> Three things came out differently from the plan, and each is argued in
+> EVENTS.md: `libs/contracts/` is `src/common/events/`; there is **one** topic
+> rather than one per producer, because Notification reads both `order.*` and
+> `partner.*` and Kafka only orders within a partition of one topic; and the
+> event constants, envelope and outbox mixins are shared rather than copied.
 
 The blueprint says to prove the spine with Order and Dispatch joined by one real
 event. Concretely, in this order:
@@ -648,9 +678,19 @@ Gate each step on a check that would fail loudly:
 
 Answer each before the code that depends on it, not after.
 
-- **`SEARCHING_PARTNER`: who moves the order into it?** Order on emitting
-  `order.confirmed`, or Dispatch acknowledging it. The first is simpler; the
-  second is honest about whether anyone is actually searching.
+- ~~**`SEARCHING_PARTNER`: who moves the order into it?**~~ **Answered:
+  Dispatch, by emitting `dispatch.search_started`.** The honest option won. The
+  state now means "somebody is actually looking", not "somebody ought to be" —
+  so an order stuck at `CONFIRMED` is visibly a dispatch that never started,
+  which is a different bug from a search that found nobody. Order consumes the
+  event; see `DeliveryService.apply_search_started`.
+
+- ~~**What the customer sees when nobody is found.**~~ **Answered: Order
+  cancels the order,** which releases the payment authorisation rather than
+  holding it against a delivery that will never happen. Dispatch reports
+  `dispatch.search_failed` with a reason and takes no view on what happens next
+  — that policy belongs to the service that owns the order. Switchable with
+  `CANCEL_ON_DISPATCH_FAILURE`.
 - **Cancellation is a saga, not a transition.** Money may be authorized. Payment
   owns the compensating flow — Order emits `order.cancelled` and does *not* wait
   for the refund. Decide what the customer sees in the gap.

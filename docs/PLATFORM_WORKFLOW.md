@@ -36,25 +36,29 @@ wired.
 
 | Blueprint service | Status in this repo | Notes |
 | --- | --- | --- |
-| gateway | **Built** | Routes `/api/users`, `/api/partners`, `/api/geo`. Needs the app-type fix in [ORDER_SERVICE.md](ORDER_SERVICE.md#trust-and-identity) |
-| user | **Built** | Auth, sessions, addresses. Needs one internal endpoint and three events |
-| partner | **Built** | Auth, KYC gate, vehicles, availability, location heartbeat, **and the availability search Dispatch needs** |
+| gateway | **Built** | Routes `/api/users`, `/api/partners`, `/api/geo`, `/api/orders`, `/api/deliveries`, `/api/dispatch`, `/api/notifications` |
+| user | **Built** | Auth, sessions, addresses, the internal address lookup Order calls. Still owes three `user.*` events |
+| partner | **Built** | Auth, KYC gate, vehicles, availability, location heartbeat, **and the availability search plus the claim Dispatch depends on** |
 | geo | **Built** | Not in the blueprint's ten — address search and reverse lookup, shared by both apps |
-| order | **Missing** | The next thing to write |
-| dispatch | **Missing** | Can start thin: partner already answers "who is nearby?" |
-| pricing | **Missing** | Stub it first — a flat rate per km is enough to prove the spine |
-| payment | **Missing** | Stub it first — auto-authorize in development |
-| location | **Missing, and deferrable** | Partner positions already live in `partners.current_latitude/longitude`. Extract when GPS volume justifies a separate store |
-| notification | **Missing** | Nothing is emitted yet for it to consume |
-| audit / analytics | **Missing** | Cheap to add — wildcard consumers, once Kafka exists |
-| Kafka / RabbitMQ | **Missing** | Not in `docker-compose.yml` yet |
-| Frontend | **Built, ahead of the backend** | Customer booking widget collects both ends with coordinates; partner app has availability, vehicles, and live position. Both are waiting on an order API |
+| order | **Built** | State machine, address snapshots, outbox, and consumers for `partner.assigned` and `dispatch.*`. Pricing and Payment still stubbed inside it |
+| dispatch | **Built** | The offer loop: consume `order.confirmed`, search, offer one at a time with a TTL, claim on 409, emit `partner.assigned` |
+| pricing | **Built** | Rate card per vehicle, public estimates, stored binding quotes. Order calls it synchronously. See [PRICING_SERVICE.md](PRICING_SERVICE.md) |
+| payment | **Stubbed inside order** | Auto-authorises in development. `PAYMENT_AUTOCONFIRM` |
+| location | **Missing, and deferrable** | Partner positions live in `partners.current_latitude/longitude`. Extract when GPS volume justifies a separate store |
+| notification | **Built** | Consumes eight event types, renders templates, stores a feed, honours preferences. Email and push are logging stubs |
+| audit / analytics | **Missing** | Cheap now: wildcard consumers on a topic that already carries real traffic |
+| **Kafka** | **Built** | `docker-compose.yml`, one broker in KRaft mode, topic `order-events`, 3 partitions keyed by `order_id`. See [EVENTS.md](EVENTS.md) |
+| RabbitMQ | **Missing** | The work queues behind Notification's email and push channels |
+| Frontend | **Built** | Booking with live per-vehicle fares, the driver's offer screen with countdown, notification feeds and settings for both apps. Live tracking is the remaining surface |
 
-The important line in that table is **partner**: `GET /internal/partners/available`
-already does the haversine search, filters on verification, active vehicle,
-online status, and heartbeat freshness, and returns candidates nearest-first
-with distances. Dispatch's first version does not need a read model, a Location
-service, or Redis — it needs to call that endpoint.
+The line that changed is **dispatch**, and with it the shape of the whole
+system. Order confirms a delivery and emits an event; Dispatch consumes it,
+finds a driver and emits another; Order records the assignment. Neither service
+calls the other, and neither knows the other exists.
+
+That is Phase 2 of the build order below, and it was the phase that mattered:
+dual writes, idempotency, partitioning and consumer groups are now solved once,
+in `src/common/events/`, for every service that comes after.
 
 ---
 
@@ -188,6 +192,10 @@ without knowing Dispatch exists.
 
 ### Phase 4 — Finding a partner (Dispatch)
 
+> Built. [DISPATCH_SERVICE.md](DISPATCH_SERVICE.md) is the detail — the
+> state machines, the lock ordering, and why the offer loop is a worker
+> rather than a Kafka handler. What follows is the shape.
+
 ```
                  Kafka: order.confirmed
                           │
@@ -226,10 +234,21 @@ Three things in that diagram carry the design:
 - **The 409 on claiming a partner is the concurrency control.** Two dispatches
   racing for one driver both call `PATCH /internal/partners/{id}/status`; the
   state machine in partnerServices lets exactly one of them through. Without
-  that, two customers get the same driver.
+  that, two customers get the same driver. The loser records the offer as
+  `lost_race` — kept distinct from a decline, because it must never count
+  against the driver.
 - **Rejection is an ordinary outcome, not an error.** `partner.rejected` feeds
-  analytics and Dispatch's own retry loop. After N candidates or T seconds,
-  Dispatch gives up and says so — and Order decides what the customer sees.
+  analytics and Dispatch's own retry loop. After `MAX_OFFERS_PER_ORDER`
+  candidates or `SEARCH_DEADLINE_SECONDS`, Dispatch gives up and emits
+  `dispatch.search_failed` with a reason — and Order decides what the customer
+  sees. Today that policy is `CANCEL_ON_DISPATCH_FAILURE`: cancel the order, so
+  the payment authorisation is released rather than held against a delivery that
+  will never happen.
+
+- **Offers reach the driver by polling, for now.** `partner.offered` reaches
+  Notification, which logs where a `push.send` job will go. Until the push
+  worker exists the partner app polls `GET /api/dispatch/offers/current`. The
+  contract does not change when push lands.
 
 ### Phase 5 — Pickup
 
@@ -363,7 +382,7 @@ consumes domain facts from Kafka and enqueues jobs on RabbitMQ.
 Each phase ends with something demonstrable. Nothing in a later phase is needed
 to prove an earlier one.
 
-### Phase 1 — An order exists
+### Phase 1 — An order exists  ✅ done
 
 - Gateway: app-type check, `X-Subject-Type`, register `/api/orders`.
 - User: `GET /internal/users/{id}/addresses/{id}`.
@@ -375,7 +394,7 @@ to prove an earlier one.
 **Done when:** the existing booking widget creates a real order with snapshotted
 addresses, and a bad `address_id` returns 404. No broker running.
 
-### Phase 2 — The spine (the phase that matters)
+### Phase 2 — The spine (the phase that matters)  ✅ done
 
 - `docker-compose.yml`: Kafka, one broker, topic `order-events`, 3 partitions.
 - `libs/contracts/`: the envelope, `order.confirmed`, `partner.assigned`.
@@ -390,6 +409,21 @@ Order and Dispatch, and the round trip survives restarting either service
 mid-flight. Every hard problem in the blueprint — dual writes, idempotency,
 partitioning, consumer groups — is now solved once.
 
+**What was actually built**, which differs from the sketch above in three ways
+worth recording:
+
+* `libs/contracts/` is `src/common/events/`, because this repo is one deployable
+  tree rather than a set of published packages.
+* **One topic, not one per producer.** `order-events` carries every event from
+  every service, keyed by `order_id`. Notification reads both `order.*` and
+  `partner.*`, and Kafka only orders within a partition of one topic — on
+  separate topics it could be told a driver arrived before it was told one was
+  found. [EVENTS.md](EVENTS.md) has the full argument.
+* **The offer loop is a worker, not the handler.** The `order.confirmed` handler
+  writes one row and returns; a background tick drives the search. A handler
+  running a three-minute search would hold its partition open and block every
+  order behind it. [DISPATCH_SERVICE.md](DISPATCH_SERVICE.md).
+
 ### Phase 3 — The partner side of a delivery
 
 - Partner offer screen: accept / reject with a countdown.
@@ -398,9 +432,10 @@ partitioning, consumer groups — is now solved once.
 
 **Done when:** one person on two devices can run a delivery start to finish.
 
-### Phase 4 — Real money
+### Phase 4 — Real money  ◐ partly done
 
-- Pricing as its own service; delete the stub.
+- ~~Pricing as its own service; delete the stub~~ — built: `pricingServices`,
+  port 8006, `pricing_db`. The stub files in orderServices are gone.
 - Payment with provider webhooks in `api/webhooks/`, signature-verified and
   idempotent; `payment.authorized` and `payment.captured`.
 - Order stops auto-confirming.
@@ -408,10 +443,16 @@ partitioning, consumer groups — is now solved once.
 **Done when:** an order cannot reach `CONFIRMED` without an authorization, and a
 webhook replayed three times charges once.
 
-### Phase 5 — Telling people things
+### Phase 5 — Telling people things  ◐ partly done
 
-- RabbitMQ, Notification as the Kafka→RabbitMQ bridge, email and push workers.
-- Cancellation saga end to end.
+- ~~Notification consuming Kafka~~ — built: templates, a stored feed for both
+  apps, per-category and per-channel preferences.
+- ~~Cancellation saga end to end~~ — built: `order.cancelled` fans out to
+  Dispatch (stop offering, release the driver) and Notification (tell both
+  sides). Payment's leg is still stubbed.
+- **Remaining:** RabbitMQ, and the email and push workers behind
+  `EmailChannel.send` and `PushChannel.send`. Both log today; the interface they
+  plug into is done.
 
 ### Phase 6 — Seeing what happened
 

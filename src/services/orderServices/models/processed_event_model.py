@@ -1,28 +1,14 @@
-from datetime import datetime
-
-from sqlalchemy import DateTime, String, Uuid, func
-from sqlalchemy.orm import Mapped, mapped_column
-
+from src.common.events.models import ProcessedEventMixin
 from src.services.orderServices.database.base import Base
 
 
-class ProcessedEvent(Base):
-    """Events this service has already acted on.
+class ProcessedEvent(ProcessedEventMixin, Base):
+    """Events order_db has already acted on.
 
-    Delivery is at-least-once, so duplicates are certain rather than
-    hypothetical. A handler checks this table first and writes to it **in the
-    same transaction as the work it did** — a separate commit leaves a window
-    where the work is done and the marker is not, and the redelivery does it
-    twice.
+    No longer empty: Order consumes `partner.assigned`, `dispatch.search_started`
+    and `dispatch.search_failed` from Dispatch. Every one of those handlers
+    writes its row here in the same transaction as the state change, which is
+    what makes a redelivery a no-op instead of a second assignment.
 
-    Empty until the first Kafka consumer lands. It exists now because the shape
-    of a handler is decided by it, and retrofitting means revisiting every one.
+    Shape and reasoning: `src/common/events/models.py`.
     """
-
-    __tablename__ = "processed_events"
-
-    event_id: Mapped[str] = mapped_column(Uuid, primary_key=True)
-    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    processed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )

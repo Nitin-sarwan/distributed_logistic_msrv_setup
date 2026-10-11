@@ -1,21 +1,36 @@
-"""Pricing, until the Pricing service exists.
+"""Pricing: the second synchronous call Order makes while a customer waits.
 
-A stub, and deliberately shaped like the thing it will become: it takes two
-points and returns a quote. When Pricing is real this file makes an HTTP call
-instead of a calculation, and nothing above it changes.
+It replaced a stub that computed the fare in-process, and nothing above this
+file changed when it did — `get_quote` kept its signature and its `Quote`, which
+is what the stub was shaped for.
 
-**Delete-me markers**, so this cannot quietly become permanent:
-  * the fare is a flat base plus a per-km rate on the *straight-line* distance;
-  * there is no surge, no vehicle multiplier, no tariff by city;
-  * `quote_id` is generated here rather than issued by anyone.
+Synchronous on purpose. The customer is on a spinner waiting to see a price,
+and an order without one is not an order: there is nothing to confirm and
+nothing to pay. PLATFORM_WORKFLOW.md lists this as one of the few REST edges in
+the order flow for exactly that reason.
+
+Two different failures, and they must not be confused:
+
+* **422 from Pricing** — the delivery cannot be priced as asked (a parcel too
+  heavy for the vehicle). The customer's to fix, so it surfaces as 422 with
+  Pricing's wording.
+* **Anything else** — Pricing is down or broken. Ours to fix, so it surfaces as
+  503 and the customer is told to try again.
 """
 
-import uuid
-from datetime import datetime, timedelta, timezone
+import logging
+from datetime import datetime
 from decimal import Decimal
 
+import httpx
+
 from src.services.orderServices.config import settings
-from src.services.orderServices.domain.pricing import haversine_km, quote_amount
+from src.services.orderServices.utils.exceptions import (
+    PricingServiceUnavailableError,
+    QuoteRefusedError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class Quote:
@@ -43,29 +58,52 @@ def get_quote(
     drop_longitude: float,
     vehicle_type: str,
     weight_kg: Decimal,
+    customer_id: int | None = None,
 ) -> Quote:
-    """What this delivery costs.
+    """What this delivery costs, as a binding quote with an id."""
+    url = f"{settings.pricing_service_url.rstrip('/')}/internal/pricing/quotes"
+    body = {
+        "pickup": {"latitude": str(pickup_latitude), "longitude": str(pickup_longitude)},
+        "drop": {"latitude": str(drop_latitude), "longitude": str(drop_longitude)},
+        "vehicle_type": vehicle_type,
+        "weight_kg": str(weight_kg),
+        "customer_id": customer_id,
+    }
 
-    `vehicle_type` and `weight_kg` are accepted and ignored. They are in the
-    signature because the real service needs them, and a stub whose signature
-    differs from its replacement is a refactor waiting to happen.
-    """
-    distance_km = haversine_km(
-        pickup_latitude, pickup_longitude, drop_latitude, drop_longitude
-    )
+    try:
+        response = httpx.post(
+            url,
+            json=body,
+            headers={"X-Internal-Key": settings.internal_api_key},
+            timeout=settings.pricing_service_timeout_seconds,
+        )
+    except httpx.HTTPError as error:
+        # No retry, for the same reason as the address lookup: a retried timeout
+        # doubles a wait the customer is already watching.
+        logger.warning("Pricing service unreachable: %s", error)
+        raise PricingServiceUnavailableError() from error
 
-    amount = quote_amount(
-        distance_km,
-        base_fare=settings.pricing_base_fare,
-        per_km=settings.pricing_per_km,
-        minimum_fare=settings.pricing_minimum_fare,
-    )
+    if response.status_code == 422:
+        detail = response.json().get("detail")
+        # A string detail is Pricing refusing the delivery in words meant for
+        # the customer. A list is a schema error, which means this client sent
+        # something malformed — our bug, not theirs.
+        if isinstance(detail, str):
+            raise QuoteRefusedError(detail)
+        logger.error("Pricing rejected the quote request shape: %s", detail)
+        raise PricingServiceUnavailableError()
 
+    if response.status_code >= 400:
+        logger.warning(
+            "Pricing service answered %s: %s", response.status_code, response.text[:300]
+        )
+        raise PricingServiceUnavailableError()
+
+    data = response.json()
     return Quote(
-        quote_id=str(uuid.uuid4()),
-        amount=amount,
-        currency=settings.pricing_currency,
-        distance_km=distance_km,
-        expires_at=datetime.now(timezone.utc)
-        + timedelta(minutes=settings.quote_ttl_minutes),
+        quote_id=data["quote_id"],
+        amount=Decimal(str(data["amount"])),
+        currency=data["currency"],
+        distance_km=Decimal(str(data["distance_km"])),
+        expires_at=datetime.fromisoformat(data["expires_at"]),
     )

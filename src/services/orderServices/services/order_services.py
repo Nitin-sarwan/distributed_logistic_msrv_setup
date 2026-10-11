@@ -86,6 +86,7 @@ class OrderService:
             drop.longitude,
             vehicle_type,
             weight_kg,
+            customer_id=customer_id,
         )
 
         order = Order(
@@ -112,6 +113,7 @@ class OrderService:
             package_description=description,
             vehicle_type=vehicle_type,
             distance_km=quote.distance_km,
+            quote_id=quote.quote_id,
             quoted_amount=quote.amount,
             currency=quote.currency,
             quote_expires_at=quote.expires_at,
@@ -374,7 +376,19 @@ class DeliveryService:
         self.db.refresh(order)
         return order
 
-    def assign_partner(
+    # ── What Dispatch causes ──────────────────────────────────────────────
+    #
+    # Each of the three below comes in two forms: an `apply_*` that stages the
+    # change and does NOT commit, and a wrapper that commits.
+    #
+    # The split is not stylistic. A Kafka handler must write its work and its
+    # `processed_events` marker in **one** transaction — commit them separately
+    # and a crash in between leaves the work done and the marker missing, so the
+    # redelivery does it twice. So the consumer calls `apply_*` and commits
+    # once, itself. The HTTP routes, which have no marker to write, call the
+    # committing wrapper.
+
+    def apply_assignment(
         self,
         order_id: int,
         partner_id: int,
@@ -383,19 +397,25 @@ class DeliveryService:
         vehicle_number: str | None,
         event_id: str | None = None,
     ) -> Order:
-        """Hand an order to a driver.
+        """Hand an order to a driver. Stages; does not commit.
 
-        **This is what consuming `partner.assigned` will do.** Dispatch decides
+        **This is what consuming `partner.assigned` does.** Dispatch decides
         who; Order only records the decision and snapshots what a customer needs
         to recognise them at the kerb.
-
-        Exposed as an internal endpoint until Kafka exists, so the flow can be
-        driven end to end — when the consumer lands it calls this same method,
-        and nothing about the assignment changes shape.
         """
         order = self.repository.find_by_id(order_id)
         if order is None:
             raise OrderNotFoundError()
+
+        # Idempotent in the one way that matters: a redelivery of the same
+        # assignment, or a second copy of it through the internal endpoint,
+        # finds the order already assigned to this partner and is a no-op rather
+        # than a 409. A *different* partner is a genuine conflict and still is.
+        if (
+            order.status == OrderStatus.PARTNER_ASSIGNED.value
+            and order.partner_id == partner_id
+        ):
+            return order
 
         if order.status not in (
             OrderStatus.CONFIRMED.value,
@@ -419,9 +439,134 @@ class DeliveryService:
             actor="dispatch",
             caused_by_event_id=event_id,
         )
+        return order
 
+    def assign_partner(
+        self,
+        order_id: int,
+        partner_id: int,
+        partner_name: str,
+        partner_phone: str,
+        vehicle_number: str | None,
+        event_id: str | None = None,
+    ) -> Order:
+        """`apply_assignment`, committed.
+
+        Kept for `POST /internal/orders/{id}/assignment`, which is now a manual
+        override rather than the normal path: assignments arrive as
+        `partner.assigned` on the topic. It stays because an operator sometimes
+        has to place an order by hand, and because it is how the flow is tested
+        without a broker running.
+        """
+        order = self.apply_assignment(
+            order_id=order_id,
+            partner_id=partner_id,
+            partner_name=partner_name,
+            partner_phone=partner_phone,
+            vehicle_number=vehicle_number,
+            event_id=event_id,
+        )
         self.db.commit()
         self.db.refresh(order)
+        return order
+
+    def apply_search_started(self, order_id: int, event_id: str | None = None) -> Order:
+        """CONFIRMED -> SEARCHING_PARTNER. Stages; does not commit.
+
+        What consuming `dispatch.search_started` does. The state exists so the
+        customer's app can say "finding you a driver" rather than leaving
+        `confirmed` on screen for the length of an offer loop, and so a support
+        question about a stuck order can be answered from the history table.
+
+        A redelivery, or an order that has already been assigned while this
+        event sat in a retry, is a no-op — never a step backwards.
+        """
+        order = self.repository.find_by_id(order_id)
+        if order is None:
+            raise OrderNotFoundError()
+
+        if order.status != OrderStatus.CONFIRMED.value:
+            logger.info(
+                "order %s is %s, not confirmed — ignoring search_started",
+                order_id,
+                order.status,
+            )
+            return order
+
+        order.status = OrderStatus.SEARCHING_PARTNER.value
+        self.repository.record_transition(
+            order.id,
+            OrderStatus.CONFIRMED.value,
+            OrderStatus.SEARCHING_PARTNER,
+            actor="dispatch",
+            caused_by_event_id=event_id,
+        )
+        return order
+
+    def apply_search_failed(
+        self,
+        order_id: int,
+        reason: str,
+        event_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> Order:
+        """Dispatch found nobody. Stages; does not commit.
+
+        **Order decides what happens, not Dispatch** — which is the whole reason
+        this is an event rather than Dispatch calling a cancel endpoint. Dispatch
+        reports a fact about its search; the policy of what a customer with no
+        available driver should experience belongs to the service that owns the
+        order.
+
+        The policy here is to cancel, because the alternative is an order that
+        sits in SEARCHING_PARTNER forever with a payment authorised against it.
+        Cancelling emits `order.cancelled` carrying `previous_status`, which is
+        what lets Payment void the authorisation and Notification tell the
+        customer to try again. Set CANCEL_ON_DISPATCH_FAILURE=false to
+        leave the order searching instead and handle it by hand.
+        """
+        from datetime import datetime, timezone
+
+        order = self.repository.find_by_id(order_id)
+        if order is None:
+            raise OrderNotFoundError()
+
+        if not settings.cancel_on_dispatch_failure:
+            logger.warning(
+                "dispatch found no partner for order %s (%s); leaving it "
+                "searching because CANCEL_ON_DISPATCH_FAILURE is false",
+                order_id,
+                reason,
+            )
+            return order
+
+        if not is_cancellable(OrderStatus(order.status)):
+            # It was assigned, picked up or already cancelled while this event
+            # waited. Nothing to do — and nothing to complain about.
+            logger.info(
+                "order %s is %s — ignoring search_failed", order_id, order.status
+            )
+            return order
+
+        previous = order.status
+        order.status = OrderStatus.CANCELLED.value
+        order.cancelled_at = datetime.now(timezone.utc)
+        order.cancellation_reason = reason
+
+        self.repository.record_transition(
+            order.id,
+            previous,
+            OrderStatus.CANCELLED,
+            actor="dispatch",
+            caused_by_event_id=event_id,
+        )
+        publisher.publish(
+            self.db,
+            publisher.ORDER_CANCELLED,
+            str(order.id),
+            payloads.order_cancelled(order, previous),
+            correlation_id,
+        )
         return order
 
 

@@ -3,6 +3,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from src.common.events.config import kafka_settings
+from src.common.events.relay import OutboxRelay
+from src.common.events.runtime import background_loops
 from src.database.mongo import (
     check_mongo_connection,
     close_mongo_connection,
@@ -13,9 +16,12 @@ from src.services.orderServices.api.internal_routes import router as internal_ro
 from src.services.orderServices.api.routes import router as order_router
 from src.services.orderServices.config import settings
 from src.services.orderServices.database.connection import (
+    SessionLocal,
     check_database_connection,
     engine,
 )
+from src.services.orderServices.events.consumers import build_consumer
+from src.services.orderServices.models.outbox_model import Outbox
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +50,20 @@ async def lifespan(app: FastAPI):
             "and calls to userServices carry no key."
         )
 
-    yield
+    # Both directions of the spine, started together and stopped together.
+    #
+    # Deliberately NOT fail-fast the way the database check above is. A broker
+    # that is down must not stop this service from taking orders: the outbox
+    # keeps queueing and the relay drains it when Kafka returns, which is the
+    # entire reason the outbox exists. An order that cannot be created is a
+    # customer turned away; an order whose event is delayed is a customer who
+    # waits a little longer.
+    relay = OutboxRelay(SessionLocal, Outbox, service_name="order")
+    consumer = build_consumer()
+
+    async with background_loops(relay.run(), consumer.run(), service="order"):
+        yield
+
     engine.dispose()
     close_mongo_connection()
 
@@ -71,4 +90,8 @@ def health():
         "service": "orderServices",
         # Surfaced so a deployment cannot quietly be giving deliveries away.
         "payment_stubbed": settings.payment_autoconfirm,
+        # Surfaced because a false here means events are piling up in the outbox
+        # and no delivery will ever be dispatched — a condition that otherwise
+        # looks like everything working.
+        "events_enabled": kafka_settings.kafka_enabled,
     }
