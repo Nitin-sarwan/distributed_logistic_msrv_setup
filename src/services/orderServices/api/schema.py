@@ -26,7 +26,10 @@ class AddressInput(BaseModel):
     address_line1: str = Field(min_length=1, max_length=500)
     address_line2: str | None = Field(default=None, max_length=500)
     city: str = Field(min_length=1, max_length=255)
-    pin_code: str
+    # Optional. The coordinates are what a driver navigates to; a PIN code is a
+    # label, and many map results ("Cubbon Park", the device's own location)
+    # have none. Asking the customer to type one blocked bookings for nothing.
+    pin_code: str | None = None
     latitude: Decimal = Field(ge=-90, le=90)
     longitude: Decimal = Field(ge=-180, le=180)
     contact_name: str = Field(min_length=1, max_length=100)
@@ -34,7 +37,10 @@ class AddressInput(BaseModel):
 
     @field_validator("pin_code")
     @classmethod
-    def validate_pin_code(cls, value: str) -> str:
+    def validate_pin_code(cls, value: str | None) -> str | None:
+        """Absent or blank is fine; given, it must be a real six-digit PIN."""
+        if value is None or not value.strip():
+            return None
         cleaned = value.strip()
         if not cleaned.isdigit() or len(cleaned) != 6:
             raise ValueError("PIN code must be exactly 6 digits")
@@ -103,7 +109,7 @@ class AddressSnapshot(BaseModel):
     line1: str
     line2: str | None
     city: str
-    pin_code: str
+    pin_code: str | None
     latitude: float
     longitude: float
     contact_name: str

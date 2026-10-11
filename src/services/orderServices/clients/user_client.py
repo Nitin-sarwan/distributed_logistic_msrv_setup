@@ -46,7 +46,7 @@ class ResolvedAddress:
         self.line1: str = address["address_line1"]
         self.line2: str | None = address.get("address_line2")
         self.city: str = address["city"]
-        self.pin_code: str = address["pin_code"]
+        self.pin_code: str | None = address.get("pin_code")
         self.latitude: float = float(address["latitude"])
         self.longitude: float = float(address["longitude"])
         self.contact_name: str = contact["name"]
