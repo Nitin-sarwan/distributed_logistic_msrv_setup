@@ -173,7 +173,7 @@ class EventConsumer:
     async def _connect(self) -> None:
         self._consumer = AIOKafkaConsumer(
             TOPIC,
-            bootstrap_servers=kafka_settings.bootstrap_servers,
+            **kafka_settings.connection_options(),
             group_id=self._group_id,
             # See the module docstring. This is the single most important
             # setting in the file.
@@ -186,7 +186,7 @@ class EventConsumer:
         await self._consumer.start()
 
         self._dlq = AIOKafkaProducer(
-            bootstrap_servers=kafka_settings.bootstrap_servers,
+            **kafka_settings.connection_options(),
             acks="all",
             value_serializer=lambda value: json.dumps(value).encode("utf-8"),
             key_serializer=lambda key: key.encode("utf-8"),

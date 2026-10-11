@@ -1,0 +1,96 @@
+# Render Blueprint: the whole backend as ONE free web service.
+#
+# All eight processes (gateway + seven services) run in one Python process —
+# see src/deploy/all_in_one.py — because the free instance has 512 MB. Only the
+# gateway is public; the services answer loopback callers only.
+#
+# Values marked `sync: false` are secrets or account-specific: Render asks for
+# them when the Blueprint is applied. docs/DEPLOY.md says where each comes from.
+
+services:
+  - type: web
+    name: logisticpartner-api
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirement.txt
+    # Creates any missing databases, migrates all seven, then serves.
+    startCommand: python -m src.deploy.start
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+
+      # ── Postgres (Neon) ────────────────────────────────────────────────
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "5432"
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_SSLMODE
+        value: require
+      # Neon's always-present database, used only to create the other seven.
+      - key: DB_ADMIN_NAME
+        value: neondb
+      # Legacy root app only; every service pins its own database name.
+      - key: DB_NAME
+        value: neondb
+
+      # ── Hashing and token secrets: random, generated once by Render ────
+      - key: STATIC_SALT
+        generateValue: true
+      - key: STATIC_PEPPER
+        generateValue: true
+      - key: PASS_SALT_STATIC
+        generateValue: true
+      - key: SECRET_KEY
+        value: aes-256-cbc
+      - key: INTERNAL_API_KEY
+        generateValue: true
+
+      # ── Sessions (Mongo Atlas) ─────────────────────────────────────────
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB_NAME
+        value: common
+      # The site is served over HTTPS (through Vercel), so cookies are Secure.
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      # The Vercel site's URL, e.g. https://logisticpartner.vercel.app
+      - key: CORS_ALLOW_ORIGINS
+        sync: false
+
+      # ── Kafka (Aiven) ──────────────────────────────────────────────────
+      - key: KAFKA_ENABLED
+        value: "true"
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+      - key: KAFKA_SECURITY_PROTOCOL
+        value: SASL_SSL
+      - key: KAFKA_SASL_MECHANISM
+        value: SCRAM-SHA-256
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+      - key: KAFKA_SSL_CA_PEM
+        sync: false
+
+      # ── Behaviour ──────────────────────────────────────────────────────
+      - key: PASSWORD_RESET_EXPOSE_TOKEN
+        value: "false"
+      # No operations screen yet: drivers are approved automatically.
+      - key: PARTNER_AUTO_VERIFY
+        value: "true"
+      # No payment provider yet: "Pay online now" is simulated.
+      - key: PAYMENT_ONLINE_AUTOCAPTURE
+        value: "true"
+      # The business's UPI ID for the driver's QR.
+      - key: PAYMENT_UPI_VPA
+        sync: false
+      # OpenStreetMap's geocoder requires a contact in the User-Agent.
+      - key: GEOCODER_USER_AGENT
+        sync: false

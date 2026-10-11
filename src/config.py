@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     db_user: str
     db_password: str
 
+    # Hosted Postgres (Neon, Render) requires TLS: set DB_SSLMODE=require there.
+    # Empty leaves the URL as it was, for the local cluster.
+    db_sslmode: str = ""
+
     # Shared session store, common to every service.
     mongo_uri: str
     mongo_db_name: str = "common"
@@ -67,6 +71,7 @@ class Settings(BaseSettings):
         return (
             f"postgresql+psycopg://{user}:{password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
+            + (f"?sslmode={self.db_sslmode}" if self.db_sslmode else "")
         )
 
 
