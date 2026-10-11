@@ -30,3 +30,9 @@ pymongo==4.17.0
 
 # Gateway -> service HTTP forwarding
 httpx==0.28.1
+
+# Kafka client for the event spine. Pure-asyncio and pip-installable on
+# Windows — unlike confluent-kafka, which needs librdkafka built or wheeled in.
+# The relay produces with it and every consumer runs on it.
+aiokafka==0.14.0
+async-timeout==5.0.1

@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     # domain, and add CSRF tokens if you do — "none" removes this protection.
     session_cookie_samesite: str = "lax"
 
+    # Shared secret for /internal/*, which the gateway does not route. The
+    # Order service presents it when resolving an address to snapshot. Empty
+    # disables the check — local machines only.
+    internal_api_key: str = ""
+
     # ── Geocoding ─────────────────────────────────────────────────────────
     # Powers /api/geo — the address search and reverse lookup behind every map
     # in the frontend. Nothing here is secret; the provider is a public service.

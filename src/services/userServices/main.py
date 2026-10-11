@@ -9,6 +9,7 @@ from src.database.mongo import (
     ensure_indexes,
 )
 from src.services.userServices.api.geo_routes import router as geo_router
+from src.services.userServices.api.internal_routes import router as internal_router
 from src.services.userServices.api.routes import router as user_router
 from src.services.userServices.database.connection import (
     check_database_connection,
@@ -47,6 +48,11 @@ app.include_router(user_router, prefix="/api")
 # Both of its endpoints are public at the gateway — see api/geo_routes.py for
 # why, and for what bounds that.
 app.include_router(geo_router, prefix="/api")
+
+# Service-to-service. Mounted WITHOUT the /api prefix on purpose: the gateway
+# routes /api/* only, so these paths do not exist at the public edge. The Order
+# service calls one of them to snapshot a delivery address.
+app.include_router(internal_router)
 
 
 @app.get("/health")

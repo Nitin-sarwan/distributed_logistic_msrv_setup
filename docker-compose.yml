@@ -1,0 +1,112 @@
+# The event spine.
+#
+# One broker, no Zookeeper. Kafka 3.9 in KRaft mode is a single process that is
+# its own metadata quorum, which is what makes a one-container broker reasonable
+# on a laptop — the old two-container arrangement existed only because Zookeeper
+# was mandatory.
+#
+#   docker compose up -d          start
+#   docker compose logs -f kafka  watch it come up
+#   docker compose down           stop, keep the data
+#   docker compose down -v        stop and wipe the log (offsets included)
+#
+# Nothing else in this repo runs in Docker. The services stay as uvicorn
+# processes on the host, which is why the broker advertises 127.0.0.1:9092.
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: logistic-kafka
+    ports:
+      # The only port the host needs. Services connect here.
+      - "9092:9092"
+    environment:
+      # ── KRaft: this node is both broker and controller ──────────────────
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # ── Listeners ───────────────────────────────────────────────────────
+      #
+      # Two of them, and the split matters. HOST is what uvicorn on Windows
+      # dials; DOCKER is what anything inside the compose network would use.
+      # A single listener cannot serve both: the address a broker *advertises*
+      # is the one clients reconnect to after the initial metadata fetch, so a
+      # broker advertising "kafka:9092" hands the host a name it cannot resolve,
+      # and one advertising "127.0.0.1:9092" points containers at themselves.
+      KAFKA_LISTENERS: HOST://0.0.0.0:9092,DOCKER://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://127.0.0.1:9092,DOCKER://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: HOST:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+
+      # ── Single-broker sanity ────────────────────────────────────────────
+      #
+      # Every default below assumes three brokers. On one, a replication factor
+      # of 3 makes the internal topics uncreatable and the first consumer group
+      # to join hangs forever with no useful error.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      # A new consumer group has no offsets to rebalance around. Zero here means
+      # the first consumer of a group starts immediately instead of waiting the
+      # default three seconds — noticeable when you restart a service by hand.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Topics are created explicitly by kafka-init below. Auto-creation would
+      # paper over a typo in a topic name with a brand new empty topic, and the
+      # partition count would be whatever the default happened to be.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # Runs once, creates the topics, exits. Idempotent: --if-not-exists means
+  # `docker compose up` a second time is a no-op rather than an error.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: logistic-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
+        --topic order-events --partitions 3 --replication-factor 1
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists \
+        --topic order-events.dlq --partitions 1 --replication-factor 1
+      echo '--- topics ---'
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
+      "
+
+  # Optional. Comment it out if you do not want a second container: nothing
+  # depends on it. http://localhost:8080 shows topics, partitions, consumer
+  # group lag, and the messages themselves — which is the difference between
+  # debugging an event flow and guessing at one.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: logistic-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: logistic
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+volumes:
+  kafka-data:

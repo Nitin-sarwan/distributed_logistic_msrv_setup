@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # that standing geocoding up as its own process is an env change, not a code
     # change.
     geo_service_url: str = "http://127.0.0.1:8001"
+    order_service_url: str = "http://127.0.0.1:8003"
+    dispatch_service_url: str = "http://127.0.0.1:8004"
+    notification_service_url: str = "http://127.0.0.1:8005"
+    pricing_service_url: str = "http://127.0.0.1:8006"
     gateway_timeout_seconds: float = 30.0
 
     # Browser origins allowed to call the gateway, comma separated.
