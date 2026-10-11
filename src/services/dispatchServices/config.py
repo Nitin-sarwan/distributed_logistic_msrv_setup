@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     db_user: str
     db_password: str
 
+    # Hosted Postgres (Neon, Render) requires TLS: set DB_SSLMODE=require there.
+    # Empty leaves the URL as it was, for the local cluster.
+    db_sslmode: str = ""
+
     # This service owns its own database, like every other service here. It
     # holds attempts and offers — the record of *how* a partner was chosen,
     # which is Dispatch's business and nobody else's. It holds no orders and no
@@ -91,6 +95,7 @@ class Settings(BaseSettings):
         return (
             f"postgresql+psycopg://{user}:{password}"
             f"@{self.db_host}:{self.db_port}/{self.dispatch_db_name}"
+            + (f"?sslmode={self.db_sslmode}" if self.db_sslmode else "")
         )
 
 

@@ -45,6 +45,19 @@ class KafkaSettings(BaseSettings):
     consumer_auto_offset_reset: str = "earliest"
     consumer_max_poll_records: int = 20
 
+    # ── Authentication, for a hosted broker ───────────────────────────────
+    #
+    # The local Docker broker needs none of this: PLAINTEXT, no login. A hosted
+    # one (Aiven, Confluent) needs SASL over TLS: set the protocol to SASL_SSL,
+    # the mechanism the provider uses, its username and password, and — when
+    # the provider signs with its own certificate authority, as Aiven does — that
+    # CA's PEM text, pasted into one env var.
+    kafka_security_protocol: str = "PLAINTEXT"
+    kafka_sasl_mechanism: str = "SCRAM-SHA-256"
+    kafka_sasl_username: str = ""
+    kafka_sasl_password: str = ""
+    kafka_ssl_ca_pem: str = ""
+
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
@@ -54,6 +67,26 @@ class KafkaSettings(BaseSettings):
     @property
     def bootstrap_servers(self) -> list[str]:
         return [s.strip() for s in self.kafka_bootstrap_servers.split(",") if s.strip()]
+
+    def connection_options(self) -> dict:
+        """Everything a client needs to reach the broker, for every producer and
+        consumer alike — so the relay, the consumers and the DLQ producer can
+        never disagree about how to log in."""
+        options: dict = {
+            "bootstrap_servers": self.bootstrap_servers,
+            "security_protocol": self.kafka_security_protocol,
+        }
+        if self.kafka_security_protocol in ("SSL", "SASL_SSL"):
+            from aiokafka.helpers import create_ssl_context
+
+            # An env var cannot hold real newlines everywhere; accept "\n".
+            ca = self.kafka_ssl_ca_pem.replace("\\n", "\n").strip()
+            options["ssl_context"] = create_ssl_context(cadata=ca or None)
+        if self.kafka_security_protocol.startswith("SASL"):
+            options["sasl_mechanism"] = self.kafka_sasl_mechanism
+            options["sasl_plain_username"] = self.kafka_sasl_username
+            options["sasl_plain_password"] = self.kafka_sasl_password
+        return options
 
 
 kafka_settings = KafkaSettings()

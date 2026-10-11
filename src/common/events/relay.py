@@ -144,7 +144,7 @@ class OutboxRelay:
 
     async def _start_producer(self) -> None:
         self._producer = AIOKafkaProducer(
-            bootstrap_servers=kafka_settings.bootstrap_servers,
+            **kafka_settings.connection_options(),
             # Every in-sync replica must have the record before it counts as
             # sent. On a single broker this is the same as acks=1; it is set
             # explicitly so adding brokers later does not quietly weaken it.

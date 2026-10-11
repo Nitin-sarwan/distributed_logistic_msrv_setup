@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     db_user: str
     db_password: str
 
+    # Hosted Postgres (Neon, Render) requires TLS: set DB_SSLMODE=require there.
+    # Empty leaves the URL as it was, for the local cluster.
+    db_sslmode: str = ""
+
     # This service owns its own database, like every other service here. It
     # holds the rate card and every quote ever issued — the record of what a
     # customer was told a delivery would cost, and on what tariff.
@@ -55,6 +59,7 @@ class Settings(BaseSettings):
         return (
             f"postgresql+psycopg://{user}:{password}"
             f"@{self.db_host}:{self.db_port}/{self.pricing_db_name}"
+            + (f"?sslmode={self.db_sslmode}" if self.db_sslmode else "")
         )
 
 
