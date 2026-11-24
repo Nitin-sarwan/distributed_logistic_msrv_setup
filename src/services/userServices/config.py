@@ -107,11 +107,25 @@ class Settings(BaseSettings):
     geocoder_cache_ttl_seconds: int = 86_400
     geocoder_cache_max_entries: int = 2_000
 
-    geocoder_search_limit: int = 5
+    geocoder_search_limit: int = 6
+
+    # Type-ahead search. Nominatim (above) matches whole words only — "Conn"
+    # finds nothing until "Connaught" is typed in full — so the search box uses
+    # Photon, an OpenStreetMap search built for autocomplete: prefix matching,
+    # typo tolerance, and ranking by distance from a bias point. Nominatim stays
+    # as the reverse geocoder (it is better at "what is at this pin") and as the
+    # search fallback when Photon is down. Empty disables Photon entirely.
+    geocoder_autocomplete_url: str = "https://photon.komoot.io"
+
+    # Photon's public instance asks for fair use, not a fixed rate. A short floor
+    # keeps a burst of keystrokes from many users polite without making the
+    # type-ahead feel laggy the way Nominatim's 1 s would.
+    geocoder_autocomplete_min_interval_seconds: float = 0.2
 
     # Per-IP quota for /api/geo, which is public. See api/geo_routes.py for what
-    # this does and does not protect against.
-    geo_rate_limit_per_minute: int = 30
+    # this does and does not protect against. Type-ahead spends one call per
+    # pause in typing, so this has to cover a person entering two addresses.
+    geo_rate_limit_per_minute: int = 60
 
     # Local dev only: returns the reset token in the API response because there
     # is no mail delivery yet. MUST stay false anywhere real — it hands account

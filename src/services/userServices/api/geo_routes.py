@@ -206,12 +206,13 @@ async def reverse_geocode(
     may not have for a field, a new road, or the middle of a lake.
     """
     try:
-        place = await reverse(latitude=lat, longitude=lng)
+        result = await reverse(latitude=lat, longitude=lng)
     except GeocoderUnavailableError as error:
         raise GEOCODER_UNAVAILABLE from error
 
     return ReverseGeocodeResponse(
         latitude=lat,
         longitude=lng,
-        place=_to_response(place) if place else None,
+        place=_to_response(result.place) if result.place else None,
+        in_service_area=result.in_service_area,
     )
