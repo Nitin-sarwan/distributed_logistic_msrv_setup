@@ -491,6 +491,27 @@ _photon_client: httpx.AsyncClient | None = None
 _photon_throttle_lock = asyncio.Lock()
 _photon_last_request_at = 0.0
 
+# Photon's public host refuses connections from some cloud ranges (Render's
+# among them), and each refused attempt costs the caller a connect timeout
+# before the Nominatim fallback even starts. After one connection failure,
+# skip Photon for a while instead of paying that on every keystroke.
+_PHOTON_BACKOFF_SECONDS = 600.0
+_photon_skip_until = 0.0
+
+
+def _photon_available() -> bool:
+    return bool(settings.geocoder_autocomplete_url) and time.monotonic() >= _photon_skip_until
+
+
+def _photon_unreachable(error: Exception) -> None:
+    global _photon_skip_until
+    _photon_skip_until = time.monotonic() + _PHOTON_BACKOFF_SECONDS
+    logger.warning(
+        "Autocomplete unreachable (%s); using Nominatim for %d minutes",
+        error,
+        _PHOTON_BACKOFF_SECONDS // 60,
+    )
+
 
 async def _get_photon_client() -> httpx.AsyncClient:
     global _photon_client
@@ -601,7 +622,10 @@ async def _photon_search(
         try:
             response = await client.get("/api/", params=params)
         except httpx.HTTPError as error:
-            logger.warning("Autocomplete request failed: %s", error)
+            if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+                _photon_unreachable(error)
+            else:
+                logger.warning("Autocomplete request failed: %s", error)
             raise GeocoderUnavailableError() from error
         finally:
             _photon_last_request_at = time.monotonic()
@@ -650,7 +674,7 @@ async def search(
         return cached
 
     results: list[Place] = []
-    if settings.geocoder_autocomplete_url:
+    if _photon_available():
         try:
             results = await _photon_search(cleaned, limit, near)
         except GeocoderUnavailableError:
@@ -798,7 +822,7 @@ async def _photon_nearest(latitude: float, longitude: float) -> Place | None:
     """
     global _photon_last_request_at
 
-    if not settings.geocoder_autocomplete_url:
+    if not _photon_available():
         return None
 
     client = await _get_photon_client()
@@ -819,7 +843,10 @@ async def _photon_nearest(latitude: float, longitude: float) -> Place | None:
         try:
             response = await client.get("/reverse", params=params)
         except httpx.HTTPError as error:
-            logger.warning("Landmark lookup failed: %s", error)
+            if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+                _photon_unreachable(error)
+            else:
+                logger.warning("Landmark lookup failed: %s", error)
             return None
         finally:
             _photon_last_request_at = time.monotonic()
