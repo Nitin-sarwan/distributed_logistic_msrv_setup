@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 
@@ -108,11 +109,92 @@ _NAME_KEYS = (
 )
 
 
+# Mainland India plus the Andaman, Nicobar and Lakshadweep islands, as
+# min_lon, min_lat, max_lon, max_lat. A box is generous at the edges (it takes in
+# slices of Pakistan, Nepal, Bangladesh, Sri Lanka...), so it narrows the search
+# and the country-code check below makes the actual decision.
+INDIA_BBOX = (68.1, 6.5, 97.4, 35.7)
+
+# Photon results that are technically places but never what someone booking a
+# pickup means: street furniture, utilities, and the individual stop poles and
+# platforms that otherwise crowd out the station they belong to.
+_PHOTON_NOISE: dict[str, set[str] | None] = {
+    "man_made": None,
+    "power": None,
+    "waterway": None,
+    "barrier": None,
+    "highway": {"bus_stop", "platform", "street_lamp", "traffic_signals", "crossing"},
+    "public_transport": {"platform", "stop_position"},
+    "railway": {"platform", "stop", "subway_entrance", "switch", "level_crossing"},
+    "amenity": {"bench", "waste_basket", "toilets", "drinking_water", "parking_entrance"},
+}
+
+
+def _allowed_country(code: str | None) -> bool:
+    """Whether a result's country is one this deployment serves.
+
+    Empty GEOCODER_COUNTRY_CODES means everywhere. A result that carries no
+    country at all is refused when a restriction is set: an unknown country is
+    not evidence of being in India, and PIN codes, phone numbers and tariffs all
+    assume it.
+    """
+    allowed = {
+        part.strip().lower()
+        for part in settings.geocoder_country_codes.split(",")
+        if part.strip()
+    }
+    if not allowed:
+        return True
+    return bool(code) and code.lower() in allowed
+
+
+def _compose_label(*parts: str | None) -> str:
+    """Join address parts into one readable line, dropping blanks and repeats.
+
+    Providers happily report the same name at several levels — "Andheri West,
+    Andheri West, Mumbai" — and Nominatim adds administrative units no person
+    writes on a parcel ("Bengaluru Central City Corporation", "K/W Ward").
+    Building the label from the structured fields instead of the provider's
+    display string is what keeps a suggestion to one line.
+    """
+    seen: set[str] = set()
+    kept: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        cleaned = part.strip()
+        key = cleaned.casefold()
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        kept.append(cleaned)
+    return ", ".join(kept)
+
+
+# Administrative suffixes OSM carries on Indian place names. "Jaipur Municipal
+# Corporation" and "Sanganer Tehsil" are correct boundaries, but a person writes
+# "Jaipur" and "Sanganer" — and the city line is what the driver reads.
+_ADMIN_SUFFIX = re.compile(
+    r"\s+(?:(?:Central|North|South|East|West|Greater)\s+)?"
+    r"(?:Municipal Corporation|City Corporation|Municipal Council|Nagar Nigam"
+    r"|Nagar Palika|Cantonment Board|Metropolitan City|Tehsil|Taluka|Taluk|taluku"
+    r"|Subdistrict|Sub-District|Mandal|Block)$",
+    re.IGNORECASE,
+)
+
+
+def _clean_admin(name: str | None) -> str | None:
+    if not name:
+        return name
+    cleaned = _ADMIN_SUFFIX.sub("", name.strip()).strip()
+    return cleaned or name.strip()
+
+
 def _first(address: dict, keys: tuple[str, ...]) -> str | None:
     for key in keys:
         value = address.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return _clean_admin(value.strip())
     return None
 
 
@@ -120,18 +202,39 @@ def _line1(raw: dict, address: dict) -> str:
     """The street line: house number + road, or the name of the place itself."""
     road = address.get("road")
     house_number = address.get("house_number")
+    name = raw.get("name")
+
+    # A named place (a mall, a café, a station) is what someone searched for
+    # and what a driver looks for on arrival; the street it is on is detail.
+    # Roads and boundaries are excluded — their "name" is the road or the
+    # administrative unit itself.
+    if name and raw.get("category") not in {"highway", "boundary", "place"} and name != road:
+        return str(name)
 
     if road:
         return f"{house_number}, {road}" if house_number else str(road)
 
     named = raw.get("name") or _first(address, _NAME_KEYS)
-    if named:
+    if named and raw.get("category") != "boundary":
         return str(named)
 
-    # Last resort: the first comma-separated chunk of the display name, which is
-    # the most specific part of it.
-    display = str(raw.get("display_name", "")).split(",")[0].strip()
-    return display or "Unnamed location"
+    # No road and no named place: an unnamed lane, which is most residential
+    # streets in Indian OSM data. The display name's first chunk is then an
+    # administrative unit ("Jaipur Municipal Corporation"), which no driver can
+    # navigate to, so prefer the neighbourhood. `reverse()` replaces this with
+    # the nearest named landmark when it can find one.
+    area = _first(address, _AREA_KEYS)
+    return area or "Unnamed road"
+
+
+def _is_vague(raw: dict) -> bool:
+    """A reverse result that names neither a road nor a place — only an area."""
+    address = raw.get("address") or {}
+    if address.get("road"):
+        return False
+    if raw.get("category") == "boundary":
+        return True
+    return not (raw.get("name") or _first(address, _NAME_KEYS))
 
 
 def _pin_code(address: dict) -> str | None:
@@ -161,21 +264,130 @@ def _to_place(raw: dict) -> Place | None:
         return None
 
     address = raw.get("address") or {}
+    if not _allowed_country(address.get("country_code")):
+        return None
+
     line1 = _line1(raw, address)
     area = _first(address, _AREA_KEYS)
+    city = _first(address, _CITY_KEYS) or ""
+    pin_code = _pin_code(address)
+    # Never repeat line 1 on line 2 — Nominatim will happily report the suburb
+    # as both when the road *is* the suburb's main road.
+    line2 = area if area and area.casefold() != line1.casefold() else None
 
     return Place(
         latitude=latitude,
         longitude=longitude,
-        label=str(raw.get("display_name") or line1),
+        label=_compose_label(line1, line2, city, address.get("state"), pin_code)
+        or line1,
         address_line1=line1,
-        # Never repeat line 1 on line 2 — Nominatim will happily report the
-        # suburb as both when the road *is* the suburb's main road.
-        address_line2=area if area and area != line1 else None,
-        city=_first(address, _CITY_KEYS) or "",
-        pin_code=_pin_code(address),
+        address_line2=line2,
+        city=city,
+        pin_code=pin_code,
         place_id=str(raw.get("place_id") or f"{latitude},{longitude}"),
     )
+
+
+def _photon_is_noise(properties: dict) -> bool:
+    key = properties.get("osm_key")
+    if key not in _PHOTON_NOISE:
+        return False
+    values = _PHOTON_NOISE[key]
+    return values is None or properties.get("osm_value") in values
+
+
+def _photon_to_place(feature: dict) -> Place | None:
+    """Map one Photon GeoJSON feature. None for anything outside the served
+    countries, without a usable position, or in the noise list above."""
+    properties = feature.get("properties") or {}
+    if not _allowed_country(properties.get("countrycode")):
+        return None
+    if _photon_is_noise(properties):
+        return None
+
+    try:
+        longitude, latitude = (float(value) for value in feature["geometry"]["coordinates"][:2])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    name = properties.get("name")
+    street = properties.get("street")
+    house_number = properties.get("housenumber")
+
+    if house_number and street:
+        line1 = f"{house_number}, {street}"
+    elif name:
+        line1 = str(name)
+    elif street:
+        line1 = str(street)
+    else:
+        return None
+
+    # Photon's `city` is often missing for Indian suburbs, which it files
+    # straight under the state — so fall back through the wider units rather
+    # than leave the driver without a town.
+    city = _clean_admin(
+        properties.get("city")
+        or properties.get("county")
+        or properties.get("district")
+        or properties.get("state")
+        or ""
+    ) or ""
+    area_candidates = (
+        _clean_admin(properties.get("locality")),
+        _clean_admin(properties.get("district")),
+        street if name and street else None,
+    )
+    line2 = next(
+        (
+            str(part)
+            for part in area_candidates
+            if part and str(part).casefold() not in {line1.casefold(), str(city).casefold()}
+        ),
+        None,
+    )
+    pin_code = _pin_code({"postcode": properties.get("postcode")})
+
+    return Place(
+        latitude=latitude,
+        longitude=longitude,
+        label=_compose_label(line1, line2, city, properties.get("state"), pin_code),
+        address_line1=line1,
+        address_line2=line2,
+        city=str(city),
+        pin_code=pin_code,
+        place_id=f"{properties.get('osm_type', '')}{properties.get('osm_id', '')}"
+        or f"{latitude},{longitude}",
+    )
+
+
+def _dedupe(places: list[Place], limit: int) -> list[Place]:
+    """Drop repeats, keeping the first (best-ranked) of each.
+
+    Two kinds show up constantly: the same label from two OSM objects (a
+    station's node and its area), and the same spot under two names (a metro
+    stop and its entrance). Matching on label, or on line 1 within ~100 m,
+    catches both without merging genuinely different places that share a name
+    across town.
+    """
+    kept: list[Place] = []
+    labels: set[str] = set()
+    spots: set[tuple[str, float, float]] = set()
+    for place in places:
+        label_key = place.label.casefold()
+        spot_key = (
+            place.address_line1.casefold(),
+            round(place.latitude, 3),
+            round(place.longitude, 3),
+        )
+        if label_key in labels or spot_key in spots:
+            continue
+        labels.add(label_key)
+        spots.add(spot_key)
+        kept.append(place)
+        if len(kept) == limit:
+            break
+    return kept
 
 
 class _TtlCache:
@@ -272,13 +484,40 @@ async def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+# Photon gets its own client and throttle: it is a different host with a
+# different policy, and sharing Nominatim's 1 s floor would make every keystroke
+# queue behind every other user's.
+_photon_client: httpx.AsyncClient | None = None
+_photon_throttle_lock = asyncio.Lock()
+_photon_last_request_at = 0.0
+
+
+async def _get_photon_client() -> httpx.AsyncClient:
+    global _photon_client
+
+    if _photon_client is None:
+        async with _client_lock:
+            if _photon_client is None:
+                _photon_client = httpx.AsyncClient(
+                    base_url=settings.geocoder_autocomplete_url.rstrip("/"),
+                    timeout=settings.geocoder_timeout_seconds,
+                    headers=_headers(),
+                    follow_redirects=True,
+                )
+
+    return _photon_client
+
+
 async def close_geocoder() -> None:
-    """Release the HTTP client. Called from the service's lifespan shutdown."""
-    global _client
+    """Release the HTTP clients. Called from the service's lifespan shutdown."""
+    global _client, _photon_client
 
     if _client is not None:
         await _client.aclose()
         _client = None
+    if _photon_client is not None:
+        await _photon_client.aclose()
+        _photon_client = None
 
 
 async def _request(path: str, params: dict) -> list[dict]:
@@ -320,6 +559,66 @@ async def _request(path: str, params: dict) -> list[dict]:
     return payload if isinstance(payload, list) else []
 
 
+async def _photon_search(
+    query: str,
+    limit: int,
+    near: tuple[float, float] | None,
+) -> list[Place]:
+    """Type-ahead search on Photon, restricted to the served countries."""
+    global _photon_last_request_at
+
+    client = await _get_photon_client()
+
+    params: list[tuple[str, str | int | float]] = [
+        ("q", query),
+        # A few more than needed, for the filters to drop — but only a few.
+        # Photon re-ranks a larger candidate set differently: asked for 18,
+        # "MG Road" near Bengaluru led with roads in Kerala and Tamil Nadu;
+        # asked for 6 it led with Bengaluru's.
+        ("limit", limit + 3),
+        ("lang", "en"),
+        # Excluded at the source as well as by _PHOTON_NOISE: a busy road has a
+        # bus stop named after it every few hundred metres, and left in they
+        # fill the result window and push the road itself out of it.
+        ("osm_tag", "!highway:bus_stop"),
+        ("osm_tag", "!public_transport:platform"),
+        ("osm_tag", "!public_transport:stop_position"),
+    ]
+    if settings.geocoder_country_codes.strip().lower() == "in":
+        min_lon, min_lat, max_lon, max_lat = INDIA_BBOX
+        params.append(("bbox", f"{min_lon},{min_lat},{max_lon},{max_lat}"))
+    if near is not None:
+        # City-scale bias: "MG Road" near Gurugram ranks Gurugram's first, but
+        # Bengaluru's is still offered if that is what is typed in full.
+        params += [("lat", near[0]), ("lon", near[1]), ("zoom", 12), ("location_bias_scale", 0.2)]
+
+    async with _photon_throttle_lock:
+        wait = settings.geocoder_autocomplete_min_interval_seconds - (
+            time.monotonic() - _photon_last_request_at
+        )
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            response = await client.get("/api/", params=params)
+        except httpx.HTTPError as error:
+            logger.warning("Autocomplete request failed: %s", error)
+            raise GeocoderUnavailableError() from error
+        finally:
+            _photon_last_request_at = time.monotonic()
+
+    if response.status_code >= 400:
+        logger.warning("Autocomplete answered %s", response.status_code)
+        raise GeocoderUnavailableError()
+
+    try:
+        features = response.json().get("features") or []
+    except (ValueError, AttributeError) as error:
+        raise GeocoderUnavailableError() from error
+
+    places = [place for place in (_photon_to_place(f) for f in features) if place]
+    return _dedupe(places, limit)
+
+
 async def search(
     query: str,
     limit: int,
@@ -331,6 +630,11 @@ async def search(
     someone typing "MG Road" while looking at Bengaluru means the one in
     Bengaluru, but a hard filter would hide the one they actually wanted if they
     had panned the map elsewhere.
+
+    Photon answers first because it understands half-typed words. Nominatim is
+    the fallback, both when Photon is unreachable and when it finds nothing:
+    Nominatim is stricter but better at full street addresses with house
+    numbers, which is exactly the query Photon is most likely to miss.
     """
     cleaned = query.strip()
     if len(cleaned) < 3:
@@ -338,11 +642,48 @@ async def search(
         # nothing costs one request less and reads identically to the user.
         return []
 
-    cache_key = f"s:{cleaned.casefold()}:{limit}:{near}"
+    # Round the bias so a pin nudged by a few metres still hits the cache.
+    near_key = (round(near[0], 2), round(near[1], 2)) if near else None
+    cache_key = f"s:{cleaned.casefold()}:{limit}:{near_key}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
 
+    results: list[Place] = []
+    if settings.geocoder_autocomplete_url:
+        try:
+            results = await _photon_search(cleaned, limit, near)
+        except GeocoderUnavailableError:
+            results = []
+
+    if not results:
+        results = await _nominatim_search(cleaned, limit, near)
+
+    results = _prefer_named_area(cleaned, results)
+    _cache.put(cache_key, results)
+    return results
+
+
+def _prefer_named_area(query: str, places: list[Place]) -> list[Place]:
+    """Put results in the area the user typed after a comma first.
+
+    "Celebal Technologies, jaipur" is a request for Jaipur, but providers rank
+    an exact name match anywhere in the country above a partial one in the
+    named city. A stable sort keeps each group's own ranking.
+    """
+    if "," not in query:
+        return places
+    area = query.rsplit(",", 1)[1].strip().casefold()
+    if len(area) < 3:
+        return places
+    return sorted(places, key=lambda place: area not in place.label.casefold())
+
+
+async def _nominatim_search(
+    cleaned: str,
+    limit: int,
+    near: tuple[float, float] | None,
+) -> list[Place]:
     params: dict[str, str | int] = {
         "q": cleaned,
         "format": "jsonv2",
@@ -362,18 +703,31 @@ async def search(
         )
 
     raw_results = await _request("/search", params)
-    results = [place for place in (_to_place(raw) for raw in raw_results) if place]
-
-    _cache.put(cache_key, results)
-    return results
+    places = [place for place in (_to_place(raw) for raw in raw_results) if place]
+    return _dedupe(places, limit)
 
 
-async def reverse(latitude: float, longitude: float) -> Place | None:
-    """The address at a point, or None if the provider knows of nothing there.
+@dataclass(frozen=True)
+class ReverseResult:
+    """What is at a point, and whether this deployment delivers there.
 
-    None is a normal answer — a pin dropped at sea or on unmapped land has no
-    address — and the caller shows the coordinates alone rather than an error.
-    The pin is still valid; a driver can be sent to it.
+    The two are separate because "no address" is not "not served": an unmapped
+    field inside India has no place but is a valid pin, while Kathmandu has a
+    perfectly good place and is outside the service area. Only the provider's
+    country code can tell them apart — a bounding box around India also
+    contains Nepal, Bhutan and Bangladesh.
+    """
+
+    place: Place | None
+    in_service_area: bool
+
+
+async def reverse(latitude: float, longitude: float) -> ReverseResult:
+    """The address at a point, with whether the point is somewhere served.
+
+    `place=None` is a normal answer — a pin dropped at sea or on unmapped land
+    has no address — and the caller shows the coordinates alone rather than an
+    error. The pin is still valid; a driver can be sent to it.
     """
     # Six decimals is the stored precision, so rounding the key here means a pin
     # nudged by a pixel reuses the cached answer instead of spending a request
@@ -381,7 +735,7 @@ async def reverse(latitude: float, longitude: float) -> Place | None:
     cache_key = f"r:{latitude:.6f},{longitude:.6f}"
     cached = _cache.get(cache_key)
     if cached is not None:
-        return cached[0] if cached else None
+        return cached[0]  # type: ignore[return-value]
 
     results = await _request(
         "/reverse",
@@ -397,5 +751,89 @@ async def reverse(latitude: float, longitude: float) -> Place | None:
     )
 
     place = _to_place(results[0]) if results else None
-    _cache.put(cache_key, [place] if place else [])
-    return place
+    # No result at all (open water, unmapped land) is given the benefit of the
+    # doubt; only a result that names another country is refused.
+    in_service_area = (
+        _allowed_country((results[0].get("address") or {}).get("country_code"))
+        if results
+        else True
+    )
+
+    # An unnamed lane is where most people actually live, and Nominatim can only
+    # describe it by its neighbourhood. Name it after the nearest landmark
+    # instead — "Near Cube Lotus, Muhana Mandi Road" is something a driver can
+    # find. The pin itself does not move: the coordinates stay the requested
+    # ones, only the words change.
+    if place is not None and results and _is_vague(results[0]):
+        landmark = await _photon_nearest(latitude, longitude)
+        if landmark is not None:
+            # Always "Near": even a numbered house is a neighbour's, and
+            # presenting "57, Amrit Nagar" as this address would send a driver
+            # to the wrong door.
+            line1 = f"Near {landmark.address_line1}"
+            line2 = landmark.address_line2 or place.address_line2
+            pin_code = place.pin_code or landmark.pin_code
+            city = place.city or landmark.city
+            place = Place(
+                latitude=place.latitude,
+                longitude=place.longitude,
+                label=_compose_label(line1, line2, city, pin_code),
+                address_line1=line1,
+                address_line2=line2,
+                city=city,
+                pin_code=pin_code,
+                place_id=place.place_id,
+            )
+
+    result = ReverseResult(place=place, in_service_area=in_service_area)
+    _cache.put(cache_key, [result])  # type: ignore[list-item]
+    return result
+
+
+async def _photon_nearest(latitude: float, longitude: float) -> Place | None:
+    """The closest named place or street within ~300 m, from Photon's reverse.
+
+    Best effort: any failure answers None and the caller keeps Nominatim's
+    neighbourhood-level answer, which is vaguer but still correct.
+    """
+    global _photon_last_request_at
+
+    if not settings.geocoder_autocomplete_url:
+        return None
+
+    client = await _get_photon_client()
+    params = {
+        "lat": latitude,
+        "lon": longitude,
+        "limit": 6,
+        "radius": 0.3,
+        "lang": "en",
+    }
+
+    async with _photon_throttle_lock:
+        wait = settings.geocoder_autocomplete_min_interval_seconds - (
+            time.monotonic() - _photon_last_request_at
+        )
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            response = await client.get("/reverse", params=params)
+        except httpx.HTTPError as error:
+            logger.warning("Landmark lookup failed: %s", error)
+            return None
+        finally:
+            _photon_last_request_at = time.monotonic()
+
+    if response.status_code >= 400:
+        return None
+    try:
+        features = response.json().get("features") or []
+    except (ValueError, AttributeError):
+        return None
+
+    for feature in features:
+        candidate = _photon_to_place(feature)
+        # Parks and similar areas are fine landmarks; a nameless house is not.
+        if candidate is not None and candidate.address_line1:
+            return candidate
+    return None

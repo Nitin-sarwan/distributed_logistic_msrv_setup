@@ -281,3 +281,7 @@ class ReverseGeocodeResponse(BaseModel):
     latitude: float
     longitude: float
     place: PlaceResponse | None
+    # False when the point is in a country this deployment does not deliver to.
+    # The frontend refuses such a pin; a bounding box cannot, since India's also
+    # contains Nepal and Bangladesh.
+    in_service_area: bool = True
